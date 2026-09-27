@@ -1,0 +1,15 @@
+# Layer contributed by the dsh-imagegen bundle.
+#
+# No endpoint is baked in: the plugin resolves `baseUrlEnv` and `apiKeyEnv` from
+# the credential plane on every call, so one installed package works on every
+# machine once IMAGE_BASE_URL and IMAGE_API_KEY exist in that machine's
+# credential store (~/.dsh/.env, or an exported variable). To pin values instead,
+# override this row by `id` in the profile's own cordis.patch.yml — a patch
+# replaces the whole config object, so restate every key there.
+- insert:
+    - id: imagegen
+      name: dsh-imagegen
+      config:
+        model: gpt-image-2.5-flare
+        size: 1024x1024
+        timeoutMs: 300000
