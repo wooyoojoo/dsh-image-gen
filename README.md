@@ -10,30 +10,33 @@
 
 ### 一键安装 / 更新（推荐）
 
-```powershell
-# 装或更新到最新（幂等：重复跑就是更新）—— 双击 install.cmd 也行
-.\install.cmd
+**只有一个文件**：`install.cmd`（双击即可，或在终端里跑）。
 
-# 常用变体
+```powershell
+.\install.cmd                              # 装或更新到最新（幂等：重复跑就是更新）
 .\install.cmd -Profile img                 # 装到别的 profile
 .\install.cmd -Ref b398714                 # 固定到某个 sha（可复现）
-.\install.cmd -DshDir D:\Git\deepseek-harness   # DSH 检出目录不在上层时显式指定
-.\install.cmd -Proxy http://127.0.0.1:20368     # 手动指定代理
-
-# 想直接调 PowerShell 也可以（参数同名）
-pwsh -File install.ps1 -Profile img -NoVerify
+.\install.cmd -DshDir D:\Git\deepseek-harness   # 显式指定 DSH 检出目录（给过一次就记住了）
+.\install.cmd -Proxy http://127.0.0.1:20368     # 手动指定代理（none = 不用）
+.\install.cmd -NoPause                     # 跑完不停（自动化调用用这个）
+.\install.cmd -Help                        # 只看用法
 ```
 
-外面那层 **`install.cmd` 不是多余的**：Windows 默认执行策略常是 `Restricted`，直接跑 `.ps1` 会被拒
-（`running scripts is disabled on this system`）；`.cmd` 外壳用 `-ExecutionPolicy Bypass` 调 PowerShell，
-于是入口就是一个**可双击的单文件**，参数也照样透传。
+**为什么是 `.cmd` 而不是 `.ps1`**（两个 Windows 特有的坑，都实测踩过）：
+
+- 默认执行策略常是 `Restricted`，直接跑 `.ps1` 会被拒（`running scripts is disabled on this system`）；`.cmd` 不受该策略约束 → 双击就能用。
+- PowerShell 5.1 把**无 BOM** 的 `.ps1` 按 ANSI 解码，中文串会乱到破坏语法解析（报的却是"缺闭合括号"，极易误诊）。
+  这个文件把 PowerShell 代码**内嵌**在 `.cmd` 里，运行时用 `[IO.File]::ReadAllText`（.NET 默认 UTF-8）读自己再执行 → **BOM 这件事彻底不用管**。
 
 脚本做五件事：① 找 DSH 检出目录：`-DshDir` → 环境变量 `DSH_DIR` → **上次记住的** → 从当前目录向上搜
 （第一次给了 `-DshDir` 之后会记在 `$DSH_HOME/imagegen-install.json`，**以后在哪跑都不用再给参数**）；
 ② **自动套用 Windows 系统代理**（浏览器能上 GitHub 而 git 不能，就是因为它不读系统代理设置 ——
 脚本只对本次命令设 `HTTP(S)_PROXY`，**不改你的全局 git 配置**）；③ 装/更新插件；
 ④ 跑插件自带的**离线 smoke（31 项）**；⑤ 再跑 `--dump-config` 确认 profile 组合树里 `imagegen` 层在位。
-最后提示你**重启 DSH**。
+最后提示你**重启 DSH**。双击运行时窗口默认**暂停**等你按回车（否则跑完就关、看不到结果）。
+
+> 非 Windows（macOS/Linux）用不了 `.cmd`：要么把内嵌的 PowerShell 段抽出来用 `pwsh` 跑，
+> 要么直接用下面的手动命令（其实就是一条 `pnpm`）。
 
 > 脚本用 UTF-8 BOM 保存，所以在 Windows PowerShell 5.1 与 PowerShell 7 下中文都能正常显示；
 > 非 Windows 上跳过注册表探测（用 `-Proxy` 指定即可），直接 `pwsh -File install.ps1`。
@@ -50,8 +53,8 @@ pnpm dsh plugin --profile web add <plugin-source-dir>
 
 # ③ 或用 tarball（最稳，适合拷到离线机器）
 cd <plugin-source-dir>
-pnpm pack                                     # 产出 dsh-imagegen-0.2.0.tgz
-pnpm dsh plugin --profile web add <plugin-source-dir>\dsh-imagegen-0.2.0.tgz
+pnpm pack                                     # 产出 dsh-imagegen-0.2.1.tgz
+pnpm dsh plugin --profile web add <plugin-source-dir>\dsh-imagegen-0.2.1.tgz
 ```
 
 `<plugin-source-dir>` 是源码目录；**本机当前克隆在** `D:\Git\dsh-image-gen`（历史：`~/.dsh/imagegen-src/dsh-imagegen` 是最早那份，原先的 `D:\Git\deepseek-harness\scratch-plugin\dsh-imagegen` 已删除，且那个路径**不在** harness 仓库的 `.gitignore` 里，别再往 harness 里放）。

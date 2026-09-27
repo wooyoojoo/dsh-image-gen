@@ -19,7 +19,6 @@
     "cordis.patch.yml",
     "README.md",
     "smoke.mjs",
-    "install.ps1",
     "install.cmd"
   ],
   "dsh": {

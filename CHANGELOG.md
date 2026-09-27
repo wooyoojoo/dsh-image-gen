@@ -4,13 +4,15 @@
 
 打包与文档发布，**插件代码（`index.js`）与 0.2.0 完全一致**。
 
-- 新增 **`install.ps1`**：一键安装/更新（幂等）。自动向上搜索 DSH 目录、**自动套用 Windows 系统代理**
-  （只对本次命令设 `HTTP(S)_PROXY`，不改全局 git 配置）、装完跑离线 smoke（31 项）+ `--dump-config` 复核，并提示重启 DSH。
-- 新增 **`install.cmd`**：`.cmd` 外壳。Windows 默认执行策略常是 `Restricted`，直接跑 `.ps1` 会被拒；
-  外壳用 `-ExecutionPolicy Bypass` 调 PowerShell，并在每次运行前**自动补回 `install.ps1` 缺失的 UTF-8 BOM**
-  （PowerShell 5.1 按 ANSI 读无 BOM 的 `.ps1`，中文串会乱到破坏语法 —— 这个坑已实测踩过）。
-- `files` 纳入两个安装器，tarball 自带走更新入口。
-- 记住 DSH 检出目录（`$DSH_HOME/imagegen-install.json`）：第一次给 `-DshDir` 之后，**零参数**也能一键安装/更新。
+- 新增 **`install.cmd`**：一键安装/更新（幂等），**只有一个文件**。
+  - 它是 `.cmd` 外壳 + **内嵌 PowerShell** 的多语言单文件：Windows 默认执行策略常是 `Restricted`，
+    直接跑 `.ps1` 会被拒；`.cmd` 不受该策略约束，双击即可。
+  - 内嵌的 PowerShell 用 `[IO.File]::ReadAllText`（.NET 默认 UTF-8）读取**本文件**再交给 `ScriptBlock` 执行 ——
+    于是彻底不需要操心 BOM（无 BOM 的 `.ps1` 会被 PowerShell 5.1 按 ANSI 解码，中文串乱到破坏语法，这个坑实测踩过）。
+  - 自动向上搜索 DSH 目录并**记住**（`$DSH_HOME/imagegen-install.json`），所以第一次给过 `-DshDir` 之后**零参数**即可；
+    **自动套用 Windows 系统代理**（只对本次命令设 `HTTP(S)_PROXY`，不改全局 git 配置）；
+    装完跑离线 smoke（31 项）+ `--dump-config` 复核；默认**暂停**以便双击时看到结果（`-NoPause` 关闭）。
+- `files` 纳入 `install.cmd`，tarball 自带走更新入口。
 - README 增加「一键安装 / 更新」章节。
 
 ## 0.2.0 — 2026-09-27
