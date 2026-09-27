@@ -8,6 +8,29 @@
 
 仓库：**<https://github.com/wooyoojoo/dsh-image-gen>** —— 源码即产物，没有构建步骤，所以 git / tarball / 目录链接三种装法跑的是同一份文件。
 
+### 一键安装 / 更新（推荐）
+
+```powershell
+# 装或更新到最新（幂等：重复跑就是更新）
+pwsh -File install.ps1
+
+# 常用变体
+pwsh -File install.ps1 -Profile img                 # 装到别的 profile
+pwsh -File install.ps1 -Ref b398714                 # 固定到某个 sha（可复现）
+pwsh -File install.ps1 -DshDir D:\Git\deepseek-harness   # DSH 检出目录不在上层时显式指定
+pwsh -File install.ps1 -Proxy http://127.0.0.1:20368     # 手动指定代理
+```
+
+脚本做四件事：① 找不到 DSH 目录时向上搜索（或用 `-DshDir` / 环境变量 `DSH_DIR`）；
+② **自动套用 Windows 系统代理**（浏览器能上 GitHub 而 git 不能，就是因为 git 不读系统代理设置 ——
+脚本只对本次命令设 `HTTP(S)_PROXY`，**不改你的全局 git 配置**）；③ 装完跑插件自带的**离线 smoke（31 项）**；
+④ 再跑一次 `--dump-config` 确认 profile 组合树里 `imagegen` 层在位。最后会提示你**重启 DSH**。
+
+> 脚本用 UTF-8 BOM 保存，所以在 Windows PowerShell 5.1 与 PowerShell 7 下中文都能正常显示；
+> 非 Windows 上会跳过注册表探测（用 `-Proxy` 指定即可）。
+
+### 手动命令（脚本做的事，或不想用脚本时）
+
 ```powershell
 # ① 从 git 装（推荐：pin 到 sha，任何机器一条命令，不需要构建许可）
 pnpm dsh plugin --profile web add github:wooyoojoo/dsh-image-gen#<sha>
