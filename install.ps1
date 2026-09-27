@@ -94,7 +94,20 @@ if ($proxyUrl) {
 }
 
 # ---------- 2. 找 DSH 检出目录 ----------
+# 解析顺序：-DshDir → $env:DSH_DIR → **上次记住的**（状态文件）→ 从当前目录向上搜。
+# 记住这一步是为了"真·一键"：第一次给了 -DshDir 之后，以后在哪跑都不用再给。
+$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME '.dsh' }
+$stateFile = Join-Path $dshHome 'imagegen-install.json'
+$remembered = $null
+if (Test-Path $stateFile) {
+    try { $remembered = (Get-Content $stateFile -Raw | ConvertFrom-Json).dshDir } catch { }
+}
+
 if (-not $DshDir) { $DshDir = $env:DSH_DIR }
+if (-not $DshDir -and $remembered -and (Test-Path $remembered)) {
+    $DshDir = $remembered
+    Write-Ok "DSH 目录：用上次记住的 $DshDir（想换用 -DshDir）"
+}
 if (-not $DshDir) {
     Write-Step "自动查找 DSH 检出目录…"
     $probe = (Get-Location).Path
@@ -113,6 +126,14 @@ if (-not $DshDir -or -not (Test-Path $DshDir)) {
     Fail "找不到 DSH 检出目录。用 -DshDir <路径> 指定（就是能跑 pnpm dsh 的那个目录）。"
 }
 Write-Ok "DSH 目录 = $DshDir"
+
+# 记下来，下次不用再给
+try {
+    $stateDir = Split-Path $stateFile -Parent
+    if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Force -Path $stateDir | Out-Null }
+    @{ dshDir = "$DshDir"; profile = "$Profile"; lastRef = "$Ref"; updatedAt = (Get-Date).ToString('s') } |
+        ConvertTo-Json | Set-Content -Path $stateFile -Encoding UTF8
+} catch { Write-Warn2 "没能记住 DSH 目录（$stateFile）：$($_.Exception.Message)" }
 
 # ---------- 3. 安装 / 更新 ----------
 $spec = "github:$Repo#$Ref"
@@ -137,7 +158,7 @@ try {
 Write-Ok "已写入 profile `"$Profile`" 的依赖"
 
 # ---------- 4. 自检 ----------
-$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME '.dsh' }
+# $dshHome 已在第 2 步算好，这里直接复用
 $pkgDir = Join-Path $dshHome "profiles/$Profile/node_modules/dsh-imagegen"
 
 if (Test-Path $pkgDir) {

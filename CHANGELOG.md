@@ -10,6 +10,7 @@
   外壳用 `-ExecutionPolicy Bypass` 调 PowerShell，并在每次运行前**自动补回 `install.ps1` 缺失的 UTF-8 BOM**
   （PowerShell 5.1 按 ANSI 读无 BOM 的 `.ps1`，中文串会乱到破坏语法 —— 这个坑已实测踩过）。
 - `files` 纳入两个安装器，tarball 自带走更新入口。
+- 记住 DSH 检出目录（`$DSH_HOME/imagegen-install.json`）：第一次给 `-DshDir` 之后，**零参数**也能一键安装/更新。
 - README 增加「一键安装 / 更新」章节。
 
 ## 0.2.0 — 2026-09-27

@@ -28,10 +28,12 @@ pwsh -File install.ps1 -Profile img -NoVerify
 （`running scripts is disabled on this system`）；`.cmd` 外壳用 `-ExecutionPolicy Bypass` 调 PowerShell，
 于是入口就是一个**可双击的单文件**，参数也照样透传。
 
-脚本做四件事：① 找不到 DSH 目录时向上搜索（或用 `-DshDir` / 环境变量 `DSH_DIR`）；
-② **自动套用 Windows 系统代理**（浏览器能上 GitHub 而 git 不能，就是因为 git 不读系统代理设置 ——
-脚本只对本次命令设 `HTTP(S)_PROXY`，**不改你的全局 git 配置**）；③ 装完跑插件自带的**离线 smoke（31 项）**；
-④ 再跑一次 `--dump-config` 确认 profile 组合树里 `imagegen` 层在位。最后会提示你**重启 DSH**。
+脚本做五件事：① 找 DSH 检出目录：`-DshDir` → 环境变量 `DSH_DIR` → **上次记住的** → 从当前目录向上搜
+（第一次给了 `-DshDir` 之后会记在 `$DSH_HOME/imagegen-install.json`，**以后在哪跑都不用再给参数**）；
+② **自动套用 Windows 系统代理**（浏览器能上 GitHub 而 git 不能，就是因为它不读系统代理设置 ——
+脚本只对本次命令设 `HTTP(S)_PROXY`，**不改你的全局 git 配置**）；③ 装/更新插件；
+④ 跑插件自带的**离线 smoke（31 项）**；⑤ 再跑 `--dump-config` 确认 profile 组合树里 `imagegen` 层在位。
+最后提示你**重启 DSH**。
 
 > 脚本用 UTF-8 BOM 保存，所以在 Windows PowerShell 5.1 与 PowerShell 7 下中文都能正常显示；
 > 非 Windows 上跳过注册表探测（用 `-Proxy` 指定即可），直接 `pwsh -File install.ps1`。
