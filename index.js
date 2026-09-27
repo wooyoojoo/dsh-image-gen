@@ -35,11 +35,21 @@
  * optional: without a mounted store the tool still saves the file and returns
  * its path.
  *
+ * The same values are also editable from the Web GUI's Plugins page, which the
+ * plugin's `client.js` renders: the endpoint and the key through the credential
+ * seam, the model, size, quality, timeout, and output directory through a small
+ * override file, and every generated image through an index beside it. All of
+ * that lives behind the routes below, registered on the Web connection's
+ * authenticated route table and therefore mounted only where a Web composition
+ * exists — a headless profile gets the tool and no routes.
+ *
  * @module dsh-imagegen
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { basename, extname, isAbsolute, join, resolve } from 'node:path'
+import { spawn } from 'node:child_process'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path'
 
 /** Cordis plugin name used by Loader diagnostics. */
 export const name = 'imagegen'
@@ -86,6 +96,36 @@ export const KIND_EDITS = 'edits'
  * image-capable route, and a text-only route receives a placeholder instead.
  */
 export const DEFAULT_ATTACH_IMAGES = true
+
+/**
+ * Fields the Plugins page may override. Everything else stays with the Loader
+ * config, so the page can only change values whose effect is visible on it.
+ */
+export const OVERRIDE_FIELDS = ['model', 'size', 'quality', 'timeoutMs', 'outputDir']
+
+/** Directory under the harness home holding this plugin's own state. */
+export const STATE_DIR_NAME = 'imagegen'
+
+/** File holding the values saved from the Plugins page. */
+export const OVERRIDES_FILE = 'config.json'
+
+/** File holding one record per generated image. */
+export const INDEX_FILE = 'images.json'
+
+/** Newest records the index keeps; older files stay on disk, unlisted. */
+export const MAX_INDEX_RECORDS = 500
+
+/** Prefix of every browser-facing endpoint this plugin registers. */
+export const ROUTE_PREFIX = '/api/imagegen'
+
+/** Images one list response returns when the caller names no size. */
+export const DEFAULT_PAGE_SIZE = 24
+
+/** Largest page one list response returns, bounding a single response. */
+export const MAX_PAGE_SIZE = 100
+
+/** How long the connectivity probe waits for the relay to answer. */
+export const PROBE_TIMEOUT_MS = 15_000
 
 /** Cap on provider error text carried into a failure message. */
 const ERROR_TEXT_LIMIT = 500
@@ -665,14 +705,615 @@ export function renderContent(value) {
   ]
 }
 
+/* ------------------------------------------------------------------ *
+ * State: the override file, the image index, and the runtime holder.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Absolute state directory for this plugin: `<DSH_HOME>/imagegen`.
+ *
+ * @param env - environment to read `DSH_HOME` from.
+ * @param home - home directory used when `DSH_HOME` states none.
+ * @returns The absolute state directory.
+ */
+export function resolveStateDir(env = process.env, home = homedir()) {
+  const configured = env.DSH_HOME
+  const base = isFilledString(configured) ? configured : join(home, '.dsh')
+  return join(base, STATE_DIR_NAME)
+}
+
+/**
+ * The values the Plugins page may change while the process runs. The tool's
+ * declared timeout is read from here on every call, so a value saved on the
+ * page bounds the next call rather than the next restart.
+ *
+ * @param config - resolved Loader config.
+ * @returns The holder carrying the state directory and the current overrides.
+ */
+export function createRuntime(config) {
+  const runtime = { stateDir: resolveStateDir(), overrides: {} }
+  runtime.effective = () => ({ ...config, ...runtime.overrides })
+  return runtime
+}
+
+/**
+ * Keep only the override fields this plugin owns, with usable values.
+ *
+ * @param value - a parsed override document, or anything else.
+ * @returns The overrides worth applying.
+ */
+export function sanitizeOverrides(value) {
+  if (!isPlainObject(value)) return {}
+  const kept = {}
+  for (const field of OVERRIDE_FIELDS) {
+    const raw = value[field]
+    if (raw === undefined || raw === null) continue
+    if (field === 'timeoutMs') {
+      if (Number.isInteger(raw) && raw >= 1) kept.timeoutMs = raw
+      continue
+    }
+    if (isFilledString(raw)) kept[field] = raw.trim()
+  }
+  return kept
+}
+
+/**
+ * Read the override file, treating an absent one as "nothing overridden".
+ *
+ * @param stateDir - the plugin's state directory.
+ * @returns The stored overrides.
+ * @throws When the file exists but cannot be read, or is not valid JSON.
+ */
+export async function readOverrides(stateDir) {
+  let text
+  try {
+    text = await readFile(join(stateDir, OVERRIDES_FILE), 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT') return {}
+    throw error
+  }
+  return sanitizeOverrides(JSON.parse(text))
+}
+
+/** Replace a file through a temporary neighbour, so a reader never sees half of it. */
+async function writeFileAtomic(target, text) {
+  await mkdir(dirname(target), { recursive: true })
+  const temp = `${target}.${process.pid}.tmp`
+  await writeFile(temp, text)
+  await rename(temp, target)
+}
+
+/**
+ * Refresh the runtime's overrides from disk.
+ *
+ * A malformed override file is reported and ignored rather than failing a
+ * generation: the Loader config still describes a usable deployment.
+ *
+ * @param ctx - plugin context, for the warning.
+ * @param runtime - the holder to update.
+ * @returns The overrides now in effect.
+ */
+export async function refreshOverrides(ctx, runtime) {
+  try {
+    runtime.overrides = await readOverrides(runtime.stateDir)
+  } catch (error) {
+    warn(ctx, error)
+    runtime.overrides = {}
+  }
+  return runtime.overrides
+}
+
+/** Report a non-fatal failure through the plugin's logger when one is mounted. */
+function warn(ctx, error) {
+  const logger = ctx.logger
+  if (logger === undefined || typeof logger.warn !== 'function') return
+  logger.warn(error instanceof Error ? error : new Error(String(error)))
+}
+
+/**
+ * Read the generated-image index, newest record first.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @returns One record per indexed image; an absent index reads as empty.
+ * @throws When the file exists but cannot be read, or is not valid JSON.
+ */
+export async function readImageIndex(stateDir) {
+  let text
+  try {
+    text = await readFile(join(stateDir, INDEX_FILE), 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT') return []
+    throw error
+  }
+  const parsed = JSON.parse(text)
+  const images = isPlainObject(parsed) ? parsed.images : undefined
+  return Array.isArray(images) ? images.filter(isImageRecord) : []
+}
+
+/** Whether `value` is a record this plugin wrote, complete enough to list. */
+function isImageRecord(value) {
+  return isPlainObject(value) && isFilledString(value.id) && isFilledString(value.path)
+}
+
+/**
+ * Replace the index, keeping the newest {@link MAX_INDEX_RECORDS} records.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param records - every record to keep, newest first.
+ */
+export async function writeImageIndex(stateDir, records) {
+  const body = JSON.stringify({ version: 1, images: records.slice(0, MAX_INDEX_RECORDS) }, null, 2)
+  await writeFileAtomic(join(stateDir, INDEX_FILE), `${body}\n`)
+}
+
+/**
+ * Serializes index writes: generation is concurrency-safe, so two overlapping
+ * calls would otherwise read the same prefix and drop one set of records.
+ */
+let indexWrites = Promise.resolve()
+
+/**
+ * Add one call's records to the index, newest first.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param records - the records that call produced.
+ * @returns Settlement after the index holds them.
+ */
+export function recordGeneratedImages(stateDir, records) {
+  const write = indexWrites.then(async () => {
+    const current = await readImageIndex(stateDir)
+    await writeImageIndex(stateDir, [...records, ...current])
+  })
+  // The queue tail stays fulfilled so one failed write cannot strand later ones.
+  indexWrites = write.then(() => undefined, () => undefined)
+  return write
+}
+
+/* ------------------------------------------------------------------ *
+ * Plugins page: the values it reads and writes, over the Web routes.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Strip userinfo from a URL so a credential embedded in a base is never echoed.
+ *
+ * @param value - the configured or stored base.
+ * @returns The base without userinfo, or the value unchanged when it is no URL.
+ */
+export function redactCredentials(value) {
+  if (!isFilledString(value)) return undefined
+  try {
+    const url = new URL(value)
+    if (url.username === '' && url.password === '') return value
+    url.username = ''
+    url.password = ''
+    return url.toString()
+  } catch {
+    return value
+  }
+}
+
+/**
+ * The `/models` endpoint implied by a base that serves the images endpoints.
+ *
+ * @param baseUrl - any base {@link resolveEndpoint} accepts.
+ * @returns The absolute models URL.
+ */
+export function modelsUrl(baseUrl) {
+  return resolveEndpoint(baseUrl, KIND_GENERATIONS).replace(/\/images\/generations$/u, '/models')
+}
+
+/**
+ * Ask the relay whether the configured base and credential reach it at all.
+ *
+ * `/models` is the cheapest request that proves both, but a relay may serve the
+ * images endpoints without it; that answer is reported as inconclusive rather
+ * than as a failure, because it says nothing about generation.
+ *
+ * @param baseUrl - configured API base.
+ * @param apiKey - credential value for this probe.
+ * @param timeoutMs - probe budget.
+ * @returns The probe's outcome.
+ */
+export async function probeConnection(baseUrl, apiKey, timeoutMs = PROBE_TIMEOUT_MS) {
+  const url = modelsUrl(baseUrl)
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: 'error',
+    })
+    if (response.ok) return { ok: true, status: response.status, url }
+    const text = await response.text().catch(() => '')
+    const inconclusive = response.status === 404 || response.status === 405
+    return {
+      ok: false,
+      inconclusive,
+      status: response.status,
+      url,
+      detail: inconclusive
+        ? `${url} answered HTTP ${response.status}: this relay serves the images endpoints without /models, so the probe proves nothing — generate one image to confirm`
+        : `${url} answered HTTP ${response.status} ${response.statusText}: ${text.slice(0, ERROR_TEXT_LIMIT)}`,
+    }
+  } catch (error) {
+    return { ok: false, status: 0, url, detail: messageOf(error) }
+  }
+}
+
+/** The message of a thrown value, whatever was thrown. */
+function messageOf(error) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** A JSON response carrying the no-store policy every settings read needs. */
+function jsonResponse(value, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  })
+}
+
+/** Read a JSON request body, or undefined when it is not a JSON object. */
+async function readJsonBody(request) {
+  try {
+    const body = await request.json()
+    return isPlainObject(body) ? body : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Report one credential reference's state without its value: whether it
+ * resolves, which layer supplies it, and whether the page may replace it.
+ *
+ * @param ctx - plugin context; `credentials` is optional.
+ * @param ref - credential reference to describe.
+ * @returns Configured, source, and writability facts.
+ */
+export async function describeCredential(ctx, ref) {
+  const credentials = ctx.get('credentials')
+  if (credentials !== undefined && typeof credentials.describe === 'function') {
+    const info = await credentials.describe(ref)
+    return { configured: info.configured === true, source: info.source, writable: info.writable === true }
+  }
+  // Without the seam the process environment is all that resolves, and it is
+  // read-only by construction.
+  return { configured: isFilledString(process.env[ref]), source: 'env', writable: false }
+}
+
+/**
+ * The Plugins page's whole read model: the endpoint, the credential's state,
+ * every overridable field with its effective value, and where state lives.
+ *
+ * @param ctx - plugin context.
+ * @param config - resolved Loader config.
+ * @param runtime - the override holder.
+ * @returns The status payload.
+ */
+export async function buildStatus(ctx, config, runtime) {
+  const baseInfo = config.baseUrl === undefined
+    ? await describeCredential(ctx, config.baseUrlEnv)
+    : { configured: true, source: 'config', writable: false }
+  const keyInfo = config.apiKey === undefined
+    ? await describeCredential(ctx, config.apiKeyEnv)
+    : { configured: true, source: 'config', writable: false }
+  const effective = runtime.effective()
+  const fields = {}
+  for (const field of OVERRIDE_FIELDS) fields[field] = effective[field] ?? null
+  return {
+    baseUrl: {
+      ref: config.baseUrlEnv,
+      // A base the profile states is the deployment's decision, so the page
+      // shows it read-only instead of offering a write that could not apply.
+      pinned: config.baseUrl !== undefined,
+      value: config.baseUrl ?? redactCredentials(await resolveNamed(ctx, config.baseUrlEnv)),
+      ...baseInfo,
+    },
+    apiKey: { ref: config.apiKeyEnv, pinned: config.apiKey !== undefined, ...keyInfo },
+    fields,
+    overrides: { ...runtime.overrides },
+    defaults: { model: DEFAULT_MODEL, size: DEFAULT_SIZE, timeoutMs: DEFAULT_TIMEOUT_MS },
+    stateDir: runtime.stateDir,
+  }
+}
+
+/**
+ * Apply one field write from the Plugins page.
+ *
+ * @param ctx - plugin context.
+ * @param config - resolved Loader config.
+ * @param runtime - the override holder, updated in place.
+ * @param body - the decoded request body, `{ field, value }`; a null value clears.
+ * @returns A failure message, or undefined when the write committed.
+ */
+export async function applyUpdate(ctx, config, runtime, body) {
+  const field = body.field
+  if (!isFilledString(field)) return 'field must name the value to change'
+  const value = body.value
+  const clearing = value === null || value === ''
+  if (field === 'baseUrl' || field === 'apiKey') {
+    if (field === 'baseUrl' && config.baseUrl !== undefined) {
+      return 'this profile sets config.baseUrl, which wins over the credential store; edit the profile patch instead'
+    }
+    if (field === 'apiKey' && config.apiKey !== undefined) {
+      return 'this profile sets config.apiKey, which wins over the credential store; edit the profile patch instead'
+    }
+    const ref = field === 'baseUrl' ? config.baseUrlEnv : config.apiKeyEnv
+    const credentials = ctx.get('credentials')
+    if (credentials === undefined || typeof credentials.set !== 'function') {
+      return 'no writable credential provider is mounted'
+    }
+    if (clearing) {
+      await credentials.unset(ref)
+      return undefined
+    }
+    if (!isFilledString(value)) return `${field} must be a non-empty string, or null to clear it`
+    if (field === 'baseUrl') {
+      try {
+        resolveEndpoint(value)
+      } catch (error) {
+        return messageOf(error)
+      }
+    }
+    try {
+      await credentials.set(ref, String(value).trim())
+    } catch (error) {
+      // The seam refuses writes it cannot honor — most often a launch-environment
+      // value shadowing the reference, and its message names that.
+      return messageOf(error)
+    }
+    return undefined
+  }
+  if (!OVERRIDE_FIELDS.includes(field)) return `unknown field ${JSON.stringify(field)}`
+  const next = { ...runtime.overrides }
+  if (clearing) {
+    delete next[field]
+  } else if (field === 'timeoutMs') {
+    const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10)
+    if (!Number.isInteger(parsed) || parsed < 1) return 'timeoutMs must be a positive integer'
+    next.timeoutMs = parsed
+  } else {
+    if (!isFilledString(value)) return `${field} must be a non-empty string, or null to clear it`
+    next[field] = String(value).trim()
+  }
+  await writeFileAtomic(join(runtime.stateDir, OVERRIDES_FILE), `${JSON.stringify(next, null, 2)}\n`)
+  runtime.overrides = next
+  return undefined
+}
+
+/**
+ * The argv that hands one file to the operating system, without a shell.
+ *
+ * @param platform - a `process.platform` value.
+ * @param path - absolute path of a file this plugin indexed.
+ * @param action - open the file itself, or select it in the file manager.
+ * @returns The command and its arguments, or undefined when the platform has none.
+ */
+export function systemOpenCommand(platform, path, action) {
+  if (platform === 'win32') {
+    return action === 'reveal'
+      ? { command: 'explorer.exe', args: [`/select,${path}`] }
+      : { command: 'explorer.exe', args: [path] }
+  }
+  if (platform === 'darwin') {
+    return { command: 'open', args: action === 'reveal' ? ['-R', path] : [path] }
+  }
+  if (platform === 'linux') {
+    return { command: 'xdg-open', args: [action === 'reveal' ? dirname(path) : path] }
+  }
+  return undefined
+}
+
+/**
+ * Start a detached helper without waiting for it: these launchers outlive the
+ * request that asked for them, and their exit codes say nothing useful.
+ *
+ * @param command - executable name resolved on PATH.
+ * @param args - argv, never a shell string.
+ * @returns Settlement once the process is running.
+ * @throws When the executable is missing or cannot be started.
+ */
+function launchDetached(command, args) {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(command, args, { detached: true, stdio: 'ignore' })
+    child.once('error', reject)
+    child.once('spawn', () => {
+      child.unref()
+      resolvePromise()
+    })
+  })
+}
+
+/** Parse a `limit` query parameter into a bounded page size. */
+function pageSize(raw) {
+  const parsed = Number.parseInt(raw ?? '', 10)
+  if (!Number.isInteger(parsed) || parsed < 1) return DEFAULT_PAGE_SIZE
+  return Math.min(MAX_PAGE_SIZE, parsed)
+}
+
+/**
+ * Every route the Plugins page calls. All of them sit under `/api`, so the
+ * connection service has already applied its host/origin fence and browser
+ * authentication before a handler runs, and none of them accepts a path: an
+ * image is named by the id this plugin indexed, never by a caller's path.
+ *
+ * @param ctx - plugin context.
+ * @param config - resolved Loader config.
+ * @param runtime - the override holder.
+ * @returns The routes to register on the connection's fetch table.
+ */
+export function buildRoutes(ctx, config, runtime) {
+  const findRecord = async (id) => (await readImageIndex(runtime.stateDir)).find(entry => entry.id === id)
+  const readBodyId = async (request) => {
+    const body = await readJsonBody(request)
+    return body !== undefined && isFilledString(body.id) ? String(body.id) : undefined
+  }
+  const openRoute = (action) => async (request) => {
+    const id = await readBodyId(request)
+    if (id === undefined) return jsonResponse({ ok: false, error: 'a JSON body with an image id is required' }, 400)
+    const record = await findRecord(id)
+    if (record === undefined) return jsonResponse({ ok: false, error: 'unknown image id' }, 404)
+    const spec = systemOpenCommand(process.platform, record.path, action)
+    if (spec === undefined) {
+      return jsonResponse({ ok: false, error: `this plugin cannot open files on ${process.platform}` }, 501)
+    }
+    try {
+      await launchDetached(spec.command, spec.args)
+    } catch (error) {
+      return jsonResponse({ ok: false, error: messageOf(error) }, 500)
+    }
+    return jsonResponse({ ok: true })
+  }
+  return [
+    {
+      path: `${ROUTE_PREFIX}/status`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => jsonResponse({ ok: true, status: await buildStatus(ctx, config, runtime) }),
+    },
+    {
+      path: `${ROUTE_PREFIX}/update`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const body = await readJsonBody(request)
+        if (body === undefined) {
+          return jsonResponse({ ok: false, error: 'the request body must be a JSON object' }, 400)
+        }
+        const failure = await applyUpdate(ctx, config, runtime, body)
+        if (failure !== undefined) return jsonResponse({ ok: false, error: failure }, 400)
+        return jsonResponse({ ok: true, status: await buildStatus(ctx, config, runtime) })
+      },
+    },
+    {
+      path: `${ROUTE_PREFIX}/test`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async () => {
+        const base = config.baseUrl ?? await resolveNamed(ctx, config.baseUrlEnv)
+        if (base === undefined) {
+          return jsonResponse({ ok: false, error: `no API base — save ${config.baseUrlEnv} first` }, 400)
+        }
+        const apiKey = config.apiKey ?? await resolveNamed(ctx, config.apiKeyEnv)
+        if (apiKey === undefined) {
+          return jsonResponse({ ok: false, error: `no credential for ${config.apiKeyEnv} — save it first` }, 400)
+        }
+        return jsonResponse({ ok: true, probe: await probeConnection(base, apiKey) })
+      },
+    },
+    {
+      path: `${ROUTE_PREFIX}/images`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const params = new URL(request.url).searchParams
+        const limit = pageSize(params.get('limit'))
+        const offset = Math.max(0, Number.parseInt(params.get('offset') ?? '0', 10) || 0)
+        const all = await readImageIndex(runtime.stateDir)
+        return jsonResponse({
+          ok: true,
+          total: all.length,
+          hasMore: offset + limit < all.length,
+          items: all.slice(offset, offset + limit),
+        })
+      },
+    },
+    {
+      path: `${ROUTE_PREFIX}/image`,
+      methods: ['GET', 'HEAD'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const id = new URL(request.url).searchParams.get('id')
+        const record = isFilledString(id) ? await findRecord(String(id)) : undefined
+        if (record === undefined) return jsonResponse({ ok: false, error: 'unknown image id' }, 404)
+        let bytes
+        try {
+          bytes = await readFile(record.path)
+        } catch (error) {
+          return jsonResponse({ ok: false, error: messageOf(error) }, error.code === 'ENOENT' ? 404 : 500)
+        }
+        return new Response(request.method === 'HEAD' ? null : bytes, {
+          headers: {
+            'content-type': record.mimeType,
+            'content-length': String(bytes.byteLength),
+            // A generated file is never rewritten in place, so a cached copy
+            // stays these exact bytes for as long as the record exists.
+            'cache-control': 'private, max-age=31536000, immutable',
+            'x-content-type-options': 'nosniff',
+            // The same fence the shipped /api/file route puts on a file it
+            // serves, so an indexed file can never become a document.
+            'content-security-policy': "sandbox; default-src 'none'",
+          },
+        })
+      },
+    },
+    {
+      path: `${ROUTE_PREFIX}/delete`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const id = await readBodyId(request)
+        if (id === undefined) return jsonResponse({ ok: false, error: 'a JSON body with an image id is required' }, 400)
+        const all = await readImageIndex(runtime.stateDir)
+        const record = all.find(entry => entry.id === id)
+        if (record === undefined) return jsonResponse({ ok: false, error: 'unknown image id' }, 404)
+        await writeImageIndex(runtime.stateDir, all.filter(entry => entry.id !== id))
+        try {
+          await unlink(record.path)
+        } catch (error) {
+          // The record is already gone, so a file this process cannot remove
+          // (already deleted, or held by another program) is reported, not fatal.
+          warn(ctx, error)
+        }
+        return jsonResponse({ ok: true, id })
+      },
+    },
+    {
+      path: `${ROUTE_PREFIX}/open`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: openRoute('open'),
+    },
+    {
+      path: `${ROUTE_PREFIX}/reveal`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: openRoute('reveal'),
+    },
+  ]
+}
+
+/**
+ * Mount the Plugins page's routes on the Web connection.
+ *
+ * The child fiber waits for a Web composition instead of declaring the service
+ * on the plugin itself: `connection` is absent from a headless profile, where
+ * the tool must still register.
+ *
+ * @param ctx - plugin context.
+ * @param config - resolved Loader config.
+ * @param runtime - the override holder.
+ */
+function mountRoutes(ctx, config, runtime) {
+  ctx.inject(['connection'], (scope) => {
+    scope.effect(() => {
+      const disposers = buildRoutes(ctx, config, runtime).map(route => scope.connection.fetch.register(route))
+      return () => Promise.all(disposers.map(dispose => dispose())).then(() => undefined)
+    }, 'imagegen: Plugins-page routes')
+  })
+}
+
 /**
  * The `generate_image` tool definition.
  *
  * @param ctx - plugin context supplying the credential seam.
  * @param config - resolved config.
+ * @param runtime - holder for the values the Plugins page can change; a fresh
+ *   one is built when a caller registers the tool on its own.
  * @returns The definition passed to `ctx.tools.register`.
  */
-export function defineGenerateImage(ctx, config) {
+export function defineGenerateImage(ctx, config, runtime = createRuntime(config)) {
   return {
     name: 'generate_image',
     description: 'Generate or edit one or more images with a third-party image model, and save them as files. '
@@ -754,17 +1395,27 @@ export function defineGenerateImage(ctx, config) {
       },
       render: (_args, value) => renderContent(value),
     },
-    timeoutMs: config.timeoutMs,
+    // Read per call by the tool-call timeout policy, so a budget saved on the
+    // Plugins page bounds the next call rather than the next restart.
+    get timeoutMs() {
+      return runtime.effective().timeoutMs
+    },
     // Distinct files per call: generation may overlap with sibling calls.
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const request = parseArgs(args, config)
+      // Overrides are read per call on the same terms as the credential, so an
+      // edit from the Plugins page — or from another process — applies to the
+      // next generation without a restart.
+      runtime.overrides = await refreshOverrides(ctx, runtime)
+      const effective = runtime.effective()
+      const request = parseArgs(args, effective)
       const kind = requestKind(request)
-      const { endpoint, apiKey } = await resolveTarget(ctx, config, kind)
-      const { entries, revisedPrompt } = await requestImages(endpoint, apiKey, request, config.timeoutMs, exec.signal)
-      const outputDir = resolveOutputDir(request.outputDir, config.outputDir)
+      const { endpoint, apiKey } = await resolveTarget(ctx, effective, kind)
+      const { entries, revisedPrompt } = await requestImages(endpoint, apiKey, request, effective.timeoutMs, exec.signal)
+      const outputDir = resolveOutputDir(request.outputDir, effective.outputDir)
       await mkdir(outputDir, { recursive: true })
       const stem = outputStem()
+      const createdAt = new Date().toISOString()
       const images = []
       for (const [index, entry] of entries.entries()) {
         const bytes = entry.kind === 'base64'
@@ -774,7 +1425,7 @@ export function defineGenerateImage(ctx, config) {
         const { mimeType, extension } = sniffImageType(bytes)
         const path = join(outputDir, `${stem}-${index + 1}${extension}`)
         await writeFile(path, bytes)
-        const attachment = await attachImage(ctx, config, bytes, mimeType, path)
+        const attachment = await attachImage(ctx, effective, bytes, mimeType, path)
         images.push(attachment === undefined
           ? { path, mimeType, bytes: bytes.byteLength }
           : { path, mimeType, bytes: bytes.byteLength, ...attachment })
@@ -782,17 +1433,44 @@ export function defineGenerateImage(ctx, config) {
       const result = { model: request.model, mode: kind, images }
       if (request.images.length > 0) result.inputImages = request.images
       if (revisedPrompt !== undefined) result.revisedPrompt = revisedPrompt
+      // Bookkeeping only: the files are saved and the result stands, so a failed
+      // index write must not fail a generation that already succeeded.
+      await recordGeneratedImages(runtime.stateDir, images.map((image, index) => ({
+        id: `${stem}-${index + 1}`,
+        createdAt,
+        path: image.path,
+        name: basename(image.path),
+        mimeType: image.mimeType,
+        bytes: image.bytes,
+        prompt: request.prompt,
+        model: request.model,
+        size: request.size,
+        mode: kind,
+        ...image.attachmentId === undefined ? {} : { attachmentId: image.attachmentId },
+        ...image.width === undefined ? {} : { width: image.width },
+        ...image.height === undefined ? {} : { height: image.height },
+        ...request.quality === undefined ? {} : { quality: request.quality },
+        ...request.images.length === 0 ? {} : { inputImages: request.images },
+      }))).catch((error) => { warn(ctx, error) })
       return result
     },
   }
 }
 
 /**
- * Register `generate_image` on the tool registry.
+ * Register `generate_image` on the tool registry, and the Plugins page's routes
+ * wherever a Web composition is present.
  *
- * @param ctx - plugin context; `tools` is required, `credentials` optional.
+ * @param ctx - plugin context; `tools` is required, `credentials` and
+ *   `connection` optional.
  * @param config - plugin row config, validated here.
  */
 export function apply(ctx, config) {
-  ctx.tools.register(defineGenerateImage(ctx, resolveConfig(config)))
+  const resolved = resolveConfig(config)
+  const runtime = createRuntime(resolved)
+  ctx.tools.register(defineGenerateImage(ctx, resolved, runtime))
+  // Warm the holder the tool's declared timeout is read from, so a value saved
+  // on the Plugins page also bounds the first call after a restart.
+  void refreshOverrides(ctx, runtime)
+  mountRoutes(ctx, resolved, runtime)
 }

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.3.0 — 2026-09-27
+
+**插件页管理**：请求地址、API KEY 和已生成的图片都能在 DSH 侧边栏「插件」页里看和改，
+不用再去翻 `~/.dsh/.env` 和输出目录。
+
+### 新增
+
+- **插件页配置区**（客户端 `plugins.bundle.config`，key = `dsh-imagegen`）：在这个 bundle 的详情页里
+  显示并修改请求地址、API KEY，以及模型 / 尺寸 / 质量 / 超时 / 输出目录，外加一个「测试连接」。
+  - 地址与 KEY 写进**凭据存储**（`~/.dsh/.credentials.yaml`）：下一次调用立即生效、不用重启，
+    密钥不落进 profile；`describe` 只回报「是否已配置 / 来源 / 可否写入」，**从不回显密钥本身**。
+  - 由启动环境提供的值会显示为只读（凭据面拒绝写入），由 profile `config` 固定住的值同样只读并说明原因。
+  - 模型 / 尺寸 / 质量 / 超时 / 输出目录写进插件自己的覆盖文件 `$DSH_HOME/imagegen/config.json`，
+    优先级为 **插件页覆盖 > cordis 配置 > 内置默认**，同样即时生效；清空并保存即恢复下层值。
+    `timeoutMs` 也一并生效：工具声明的调用预算本来就是每次调用现读的。
+- **已生成图片画廊**（客户端 `plugins.detail.section`）：同一页底部按时间倒序列出生成过的图片，
+  每张有缩略图、原 prompt、模式 / 尺寸 / 体积 / 时间，操作有：点击放大（灯箱）、用系统应用打开、
+  在文件管理器中定位、复制路径、把 `generate_image` 参数（prompt + image 路径）复制到剪贴板以便再次编辑、删除。
+  - 生成时写一条索引记录（prompt / 模型 / 尺寸 / 质量 / 模式 / 输入图 / 字节 / 宽高 / 附件 id）到
+    `$DSH_HOME/imagegen/images.json`（原子写，保留最新 500 条）。
+- **主机侧认证路由**（`/api/imagegen/*`，注册在 Web 连接的精确路由表上）：
+  `status` / `update` / `test` / `images` / `image` / `delete` / `open` / `reveal`。
+  - 全部位于 `/api` 之下，因此先过连接层的 Host/Origin 围栏与浏览器 cookie 认证；
+    **未认证请求得到 401**（已实测）。
+  - **只按 id 取图，不接受调用方给的路径**：页面无法借这个插件读任意文件。
+  - `connection` 是**可选**依赖，用 `ctx.inject(['connection'], …)` 挂在子 fiber 上，
+    所以 headless profile 里工具照常注册、只是没有这些路由。
+- `smoke.mjs`：31 → **68 项**。新增覆盖状态目录与覆盖文件、凭据读写与只读/固定值的拒绝路径、
+  图片索引、全部 8 条路由（含「按 id 而非路径取图」与「open/reveal 对未知 id 不启动任何进程」）、
+  连通性探测的三种结果、`apply` 的两种组合（**没有 Web connection 时工具照常注册**，有时挂上 8 条路由），
+  以及**在 VM 里按模块加载器的方式执行 `client.js`**：
+  驱动 `apply` 校验三处注册（名称 / key / id）、译文字典，并渲染每个界面的首屏状态。
+
+### 校验
+
+- `node smoke.mjs` → **68/68**
+- 临时 profile 里真实启动 `dsh web`（`dsh plugin add D:\Git\dsh-image-gen` 链接安装）：
+  - 启动成功 = `client.js` 与 `index.js` 都能被真实组合加载
+  - `GET /api/imagegen/status` 未认证 → **401**；换取 cookie 后 → **200**，读到的正是本机真实凭据面
+  - `POST /api/imagegen/test` → 真实探测 `https://cf.api.fan/v1/models` 得 **HTTP 200**
+  - `update` 的非法地址 / 未知字段 → **400** 且不落盘；`image?id=nope` → **404**
+  - 客户端 bundle 由 `/plugins/??dsh-imagegen/client.js` 送出，内容含新的两个 slot 注册
+  - 验证结束后删除临时 profile；真实 `~/.dsh/.credentials.yaml` 与状态目录均未被改动
+
+### 已知缺口
+
+- **客户端界面的实际 DOM 渲染仍未经自动化验证**（本机没有浏览器自动化）。
+  VM 覆盖到了「模块能加载、三处注册正确、每个界面首屏能渲染」，但点击、灯箱、剪贴板这些
+  交互行为仍需在真实 GUI 里看一眼。
+- **没有自带缩略图**：不引入图像解码库，缩略图就是原图字节 + `loading="lazy"` + 长缓存。
+  一页 24 张时只请求可见的那几张；把输出目录指向巨型 PNG 且一次列出几百张会更费流量。
+
 ## 0.2.1 — 2026-09-27
 
 打包与文档发布，**插件代码（`index.js`）与 0.2.0 完全一致**。

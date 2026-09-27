@@ -4,9 +4,14 @@
  *   node smoke.mjs
  *
  * Covers the pure helpers (endpoint resolution, argument validation, request
- * bodies) and then drives the real `execute` against a local stub server that
- * speaks both endpoints — which is the only way to prove the multipart edit
- * path and the file-saving path without spending a provider call.
+ * bodies), the Plugins-page surface (the override file, the image index, every
+ * host route, and the credential writes), and then drives the real `execute`
+ * against a local stub server that speaks both endpoints — which is the only
+ * way to prove the multipart edit path, the file-saving path, and the index
+ * write without spending a provider call.
+ *
+ * The harness home is redirected to a temporary directory before anything
+ * touches it, so a test run never reads or writes the real `~/.dsh/imagegen`.
  *
  * Scope note: this file covers the **server half** (`index.js`). The original
  * scratch-directory smoke also loaded `client.js` in a VM and drove the card
@@ -15,20 +20,39 @@
  */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import vm from 'node:vm'
 
 import {
   appendEditFields,
+  apply,
+  applyUpdate,
   buildGenerationBody,
+  buildRoutes,
+  buildStatus,
+  createRuntime,
   defineGenerateImage,
   MAX_INPUT_IMAGES,
+  modelsUrl,
+  OVERRIDE_FIELDS,
   parseArgs,
+  probeConnection,
+  readImageIndex,
+  readOverrides,
+  recordGeneratedImages,
+  redactCredentials,
   requestKind,
   resolveConfig,
   resolveEndpoint,
   resolveOutputDir,
+  resolveStateDir,
+  ROUTE_PREFIX,
+  sanitizeOverrides,
+  STATE_DIR_NAME,
+  systemOpenCommand,
 } from './index.js'
 
 /** A real 1x1 PNG, so the sniffing and the byte comparison both mean something. */
@@ -194,6 +218,10 @@ const inputImage = join(dir, 'in.png')
 const maskImage = join(dir, 'mask.png')
 await writeFile(inputImage, PNG)
 await writeFile(maskImage, PNG)
+// The plugin's own state lives under the harness home; point it at this test's
+// directory so a run never reads or writes the real one.
+const previousHome = process.env.DSH_HOME
+process.env.DSH_HOME = join(dir, 'home')
 
 const seen = []
 const server = createServer((req, res) => {
@@ -259,6 +287,20 @@ try {
     assert.deepEqual(await readFile(result.images[0].path), PNG)
   })
 
+  await checkAsync('every generated image is recorded in the index with what produced it', async () => {
+    const index = await readImageIndex(resolveStateDir())
+    assert.equal(index.length, 2)
+    const newest = index[0]
+    assert.equal(newest.mode, 'edits')
+    assert.equal(newest.prompt, 'make the arm thicker')
+    assert.equal(newest.model, 'stub-model')
+    assert.equal(newest.bytes, PNG.byteLength)
+    assert.equal(newest.mimeType, 'image/png')
+    assert.equal(newest.name.endsWith('.png'), true)
+    assert.deepEqual(newest.inputImages, [inputImage])
+    assert.equal(index[1].mode, 'generations')
+  })
+
   await checkAsync('an unreadable input image fails before any request', async () => {
     const before = seen.length
     await assert.rejects(
@@ -278,8 +320,534 @@ try {
   })
 } finally {
   await new Promise(done => server.close(done))
+  if (previousHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = previousHome
   await rm(dir, { recursive: true, force: true })
 }
+
+console.log('state and overrides')
+check('DSH_HOME decides the state directory, the home directory is the fallback', () => {
+  assert.equal(resolveStateDir({ DSH_HOME: 'C:/dsh' }, 'C:/users/x'), join('C:/dsh', STATE_DIR_NAME))
+  assert.equal(resolveStateDir({}, 'C:/users/x'), join('C:/users/x', '.dsh', STATE_DIR_NAME))
+  assert.equal(resolveStateDir({ DSH_HOME: '   ' }, 'C:/users/x'), join('C:/users/x', '.dsh', STATE_DIR_NAME))
+})
+check('sanitizing keeps only owned fields, with usable values', () => {
+  assert.deepEqual(
+    sanitizeOverrides({ model: ' m ', size: 7, quality: '', timeoutMs: 0, outputDir: 'D:/out', baseUrl: 'x', extra: 1 }),
+    { model: 'm', outputDir: 'D:/out' },
+  )
+  assert.deepEqual(sanitizeOverrides({ timeoutMs: 1000 }), { timeoutMs: 1000 })
+  assert.deepEqual(sanitizeOverrides('nope'), {})
+  assert.deepEqual(sanitizeOverrides(null), {})
+})
+check('a base URL never echoes embedded credentials', () => {
+  assert.equal(redactCredentials('https://relay.example.com/v1'), 'https://relay.example.com/v1')
+  assert.equal(redactCredentials('https://user:pass@relay.example.com/v1'), 'https://relay.example.com/v1')
+  assert.equal(redactCredentials(undefined), undefined)
+})
+check('the models URL derives from every accepted base form', () => {
+  for (const base of ['https://r.example.com', 'https://r.example.com/v1', 'https://r.example.com/v1/images/generations']) {
+    assert.equal(modelsUrl(base), 'https://r.example.com/v1/models')
+  }
+})
+check('the system open command is argv, never a shell, and matches the platform', () => {
+  assert.deepEqual(systemOpenCommand('win32', 'D:/a/b.png', 'reveal'), { command: 'explorer.exe', args: ['/select,D:/a/b.png'] })
+  assert.deepEqual(systemOpenCommand('win32', 'D:/a/b.png', 'open'), { command: 'explorer.exe', args: ['D:/a/b.png'] })
+  assert.deepEqual(systemOpenCommand('darwin', '/a/b.png', 'open'), { command: 'open', args: ['/a/b.png'] })
+  assert.deepEqual(systemOpenCommand('darwin', '/a/b.png', 'reveal'), { command: 'open', args: ['-R', '/a/b.png'] })
+  assert.deepEqual(systemOpenCommand('linux', '/a/b.png', 'reveal'), { command: 'xdg-open', args: ['/a'] })
+  assert.equal(systemOpenCommand('aix', '/a/b.png', 'open'), undefined)
+})
+
+/** A credential provider with the seam's shape: resolve, describe, set, unset. */
+function fakeCredentialProvider(store = {}) {
+  return {
+    store,
+    async resolve(ref) {
+      return store[ref] === undefined ? undefined : { value: store[ref], source: 'file' }
+    },
+    async describe(ref) {
+      return store[ref] === undefined
+        ? { configured: false, writable: true }
+        : { configured: true, source: 'file', writable: true }
+    },
+    async set(ref, value) { store[ref] = value },
+    async unset(ref) { delete store[ref] },
+  }
+}
+
+/** The plugin context shape these helpers read: `credentials` and nothing else. */
+const fakeCtx = (credentials) => ({ get: name => (name === 'credentials' ? credentials : undefined) })
+
+console.log('the Plugins page: status, credentials, and overrides')
+const pageDir = await mkdtemp(join(tmpdir(), 'dsh-imagegen-page-'))
+const pageHome = join(pageDir, 'home')
+const homeBeforePage = process.env.DSH_HOME
+process.env.DSH_HOME = pageHome
+
+const credentials = fakeCredentialProvider()
+const pageCtx = fakeCtx(credentials)
+const pageConfig = resolveConfig({ outputDir: pageDir })
+const pageRuntime = createRuntime(pageConfig)
+
+try {
+  await checkAsync('status reports unconfigured credentials and no overrides', async () => {
+    const status = await buildStatus(pageCtx, pageConfig, pageRuntime)
+    assert.equal(status.baseUrl.ref, 'IMAGE_BASE_URL')
+    assert.equal(status.baseUrl.configured, false)
+    assert.equal(status.baseUrl.pinned, false)
+    assert.equal(status.apiKey.writable, true)
+    assert.deepEqual(status.overrides, {})
+    assert.equal(status.stateDir, join(pageHome, STATE_DIR_NAME))
+    assert.equal(status.fields.model, 'gpt-image-2.5-flare')
+    assert.equal(status.fields.timeoutMs, 300_000)
+    // A field the deployment never set reports null, which the page shows as blank.
+    assert.equal(status.fields.quality, null)
+    for (const field of OVERRIDE_FIELDS) {
+      const value = status.fields[field]
+      assert.equal(value === null || typeof value === 'string' || typeof value === 'number', true, field)
+    }
+  })
+
+  await checkAsync('writing the endpoint and the key lands in the credential store', async () => {
+    assert.equal(await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: 'baseUrl', value: 'https://relay.example.com/v1' }), undefined)
+    assert.equal(await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: 'apiKey', value: ' sk-test ' }), undefined)
+    assert.deepEqual(credentials.store, {
+      IMAGE_BASE_URL: 'https://relay.example.com/v1',
+      IMAGE_API_KEY: 'sk-test',
+    })
+    const status = await buildStatus(pageCtx, pageConfig, pageRuntime)
+    assert.equal(status.baseUrl.value, 'https://relay.example.com/v1')
+    assert.equal(status.baseUrl.configured, true)
+    assert.equal(status.apiKey.configured, true)
+    // The key itself never crosses to the page, only whether one is stored.
+    assert.equal('value' in status.apiKey, false)
+  })
+
+  await checkAsync('a malformed endpoint is refused with the resolver message', async () => {
+    const failure = await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: 'baseUrl', value: 'not a url' })
+    assert.match(failure, /not an absolute URL/)
+    assert.equal(credentials.store.IMAGE_BASE_URL, 'https://relay.example.com/v1')
+  })
+
+  await checkAsync('clearing a credential removes it from the store', async () => {
+    assert.equal(await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: 'apiKey', value: null }), undefined)
+    assert.equal('IMAGE_API_KEY' in credentials.store, false)
+  })
+
+  await checkAsync('an override is written to disk and reaches the effective values', async () => {
+    assert.equal(await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: 'model', value: 'gpt-image-2.5-flare' }), undefined)
+    assert.equal(await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: 'timeoutMs', value: '45000' }), undefined)
+    assert.deepEqual(await readOverrides(pageRuntime.stateDir), { model: 'gpt-image-2.5-flare', timeoutMs: 45_000 })
+    assert.equal(pageRuntime.effective().model, 'gpt-image-2.5-flare')
+    assert.equal(pageRuntime.effective().timeoutMs, 45_000)
+    // The declared budget is read per call, so it follows the override.
+    assert.equal(defineGenerateImage(pageCtx, pageConfig, pageRuntime).timeoutMs, 45_000)
+  })
+
+  await checkAsync('clearing an override falls back to the configured value', async () => {
+    assert.equal(await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: 'model', value: '' }), undefined)
+    assert.deepEqual(await readOverrides(pageRuntime.stateDir), { timeoutMs: 45_000 })
+    assert.equal(pageRuntime.effective().model, pageConfig.model)
+  })
+
+  await checkAsync('a non-integer timeout and an unknown field are refused', async () => {
+    assert.match(await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: 'timeoutMs', value: 'soon' }), /positive integer/)
+    assert.match(await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: 'baseUrlEnv', value: 'X' }), /unknown field/)
+    assert.match(await applyUpdate(pageCtx, pageConfig, pageRuntime, { field: '', value: 'X' }), /must name the value/)
+  })
+
+  await checkAsync('a value the profile pins is refused, not silently ignored', async () => {
+    const pinned = resolveConfig({ baseUrl: 'https://pinned.example.com/v1', outputDir: pageDir })
+    const failure = await applyUpdate(pageCtx, pinned, createRuntime(pinned), { field: 'baseUrl', value: 'https://other.example.com' })
+    assert.match(failure, /config\.baseUrl/)
+    const status = await buildStatus(pageCtx, pinned, createRuntime(pinned))
+    assert.equal(status.baseUrl.pinned, true)
+    assert.equal(status.baseUrl.writable, false)
+  })
+
+  await checkAsync('a credential the seam refuses surfaces the seam message', async () => {
+    const refusing = fakeCtx({
+      async describe() { return { configured: true, source: 'env', writable: false } },
+      async set() { throw new Error('credentials: "IMAGE_API_KEY" is supplied read-only by the launching environment') },
+      async unset() { throw new Error('unreachable') },
+    })
+    const failure = await applyUpdate(refusing, pageConfig, pageRuntime, { field: 'apiKey', value: 'sk-x' })
+    assert.match(failure, /read-only/)
+  })
+} finally {
+  if (homeBeforePage === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = homeBeforePage
+}
+
+console.log('the Plugins page: host routes')
+const routeDir = await mkdtemp(join(tmpdir(), 'dsh-imagegen-routes-'))
+const homeBeforeRoutes = process.env.DSH_HOME
+process.env.DSH_HOME = join(routeDir, 'home')
+
+const routeImage = join(routeDir, 'image-1.png')
+await writeFile(routeImage, PNG)
+const routeConfig = resolveConfig({ outputDir: routeDir })
+const routeRuntime = createRuntime(routeConfig)
+await recordGeneratedImages(routeRuntime.stateDir, [{
+  id: 'image-1',
+  createdAt: '2026-09-27T00:00:00.000Z',
+  path: routeImage,
+  name: 'image-1.png',
+  mimeType: 'image/png',
+  bytes: PNG.byteLength,
+  prompt: 'a cat',
+  model: 'stub-model',
+  size: '1024x1024',
+  mode: 'generations',
+}])
+const routes = buildRoutes(fakeCtx(fakeCredentialProvider({ IMAGE_API_KEY: 'k' })), routeConfig, routeRuntime)
+const routeOf = (name) => routes.find(candidate => candidate.path === `${ROUTE_PREFIX}/${name}`)
+const call = (name, { method = 'GET', body, query = '' } = {}) => {
+  const url = `http://127.0.0.1${ROUTE_PREFIX}/${name}${query}`
+  return routeOf(name).fetch(new Request(url, method === 'GET' ? { method } : {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+  }))
+}
+
+try {
+  await checkAsync('every route sits under the authenticated /api prefix and buffers its body', async () => {
+    assert.deepEqual(routes.map(one => one.path), [
+      `${ROUTE_PREFIX}/status`,
+      `${ROUTE_PREFIX}/update`,
+      `${ROUTE_PREFIX}/test`,
+      `${ROUTE_PREFIX}/images`,
+      `${ROUTE_PREFIX}/image`,
+      `${ROUTE_PREFIX}/delete`,
+      `${ROUTE_PREFIX}/open`,
+      `${ROUTE_PREFIX}/reveal`,
+    ])
+    for (const one of routes) {
+      assert.equal(one.path.startsWith('/api/'), true)
+      assert.equal(one.requestBody, 'buffered')
+      assert.equal(one.methods.length > 0, true)
+    }
+  })
+
+  await checkAsync('the status route answers the whole read model', async () => {
+    const payload = await (await call('status')).json()
+    assert.equal(payload.ok, true)
+    assert.equal(payload.status.apiKey.configured, true)
+    assert.equal('value' in payload.status.apiKey, false)
+  })
+
+  await checkAsync('the update route commits and answers the fresh status', async () => {
+    const response = await call('update', { method: 'POST', body: { field: 'size', value: '1536x1024' } })
+    assert.equal(response.status, 200)
+    assert.equal((await response.json()).status.fields.size, '1536x1024')
+    assert.equal(routeRuntime.effective().size, '1536x1024')
+  })
+
+  await checkAsync('a refused update answers 400 with the reason', async () => {
+    const response = await call('update', { method: 'POST', body: { field: 'baseUrl', value: 'nope' } })
+    assert.equal(response.status, 400)
+    assert.match((await response.json()).error, /not an absolute URL/)
+  })
+
+  await checkAsync('the images route pages the index', async () => {
+    const payload = await (await call('images', { query: '?limit=1' })).json()
+    assert.equal(payload.total, 1)
+    assert.equal(payload.hasMore, false)
+    assert.equal(payload.items[0].id, 'image-1')
+    assert.equal(payload.items[0].prompt, 'a cat')
+  })
+
+  await checkAsync('the image route serves the recorded file with its sniffed type', async () => {
+    const response = await call('image', { query: '?id=image-1' })
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('content-type'), 'image/png')
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), PNG)
+  })
+
+  await checkAsync('the image route refuses an unknown id and a missing one', async () => {
+    assert.equal((await call('image', { query: '?id=nope' })).status, 404)
+    assert.equal((await call('image')).status, 404)
+  })
+
+  await checkAsync('no route accepts a caller-supplied path', async () => {
+    // The id is the only addressing unit, so a path in its place is just an
+    // unknown id: a page cannot read an arbitrary file through this plugin.
+    const response = await call('image', { query: `?id=${encodeURIComponent(routeImage)}` })
+    assert.equal(response.status, 404)
+  })
+
+  await checkAsync('the delete route removes the record and the file', async () => {
+    assert.deepEqual(await (await call('delete', { method: 'POST', body: { id: 'image-1' } })).json(), { ok: true, id: 'image-1' })
+    assert.deepEqual(await readImageIndex(routeRuntime.stateDir), [])
+    await assert.rejects(() => readFile(routeImage))
+  })
+
+  await checkAsync('the open routes refuse an unknown id without launching anything', async () => {
+    for (const name of ['open', 'reveal']) {
+      assert.equal((await call(name, { method: 'POST', body: { id: 'gone' } })).status, 404)
+    }
+    assert.equal((await call('open', { method: 'POST', body: {} })).status, 400)
+  })
+
+  await checkAsync('the test route asks for a base before probing', async () => {
+    const bare = resolveConfig({ outputDir: routeDir, baseUrlEnv: 'ABSENT_BASE_URL' })
+    const handler = buildRoutes(fakeCtx(fakeCredentialProvider()), bare, createRuntime(bare))
+      .find(one => one.path === `${ROUTE_PREFIX}/test`)
+    const response = await handler.fetch(new Request(`http://127.0.0.1${ROUTE_PREFIX}/test`, { method: 'POST' }))
+    assert.equal(response.status, 400)
+    assert.match((await response.json()).error, /no API base/)
+  })
+} finally {
+  if (homeBeforeRoutes === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = homeBeforeRoutes
+  await rm(routeDir, { recursive: true, force: true })
+}
+
+console.log('connectivity probe')
+const probeServer = createServer((req, res) => {
+  if (req.url === '/v1/models') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{"data":[]}')
+    return
+  }
+  res.writeHead(404)
+  res.end('nope')
+})
+await new Promise(ready => probeServer.listen(0, '127.0.0.1', ready))
+try {
+  const origin = `http://127.0.0.1:${probeServer.address().port}`
+  await checkAsync('a reachable /models endpoint proves the base and the key', async () => {
+    const probe = await probeConnection(`${origin}/v1`, 'k')
+    assert.equal(probe.ok, true)
+    assert.equal(probe.status, 200)
+    assert.equal(probe.url, `${origin}/v1/models`)
+  })
+  await checkAsync('a relay without /models is inconclusive, not a failure', async () => {
+    const probe = await probeConnection(`${origin}/other/v1`, 'k')
+    assert.equal(probe.ok, false)
+    assert.equal(probe.inconclusive, true)
+    assert.match(probe.detail, /proves nothing/)
+  })
+  await checkAsync('an unreachable endpoint reports the transport failure', async () => {
+    const probe = await probeConnection('http://127.0.0.1:1/v1', 'k', 2000)
+    assert.equal(probe.ok, false)
+    assert.equal(probe.status, 0)
+    assert.equal(typeof probe.detail, 'string')
+  })
+} finally {
+  await new Promise(done => probeServer.close(done))
+}
+
+console.log('apply wiring')
+const wiringDir = await mkdtemp(join(tmpdir(), 'dsh-imagegen-wiring-'))
+const homeBeforeWiring = process.env.DSH_HOME
+process.env.DSH_HOME = join(wiringDir, 'home')
+
+/** A context with only the members `apply` touches, so the wiring is the subject. */
+function applyCtx({ onInject }) {
+  const tools = []
+  return {
+    tools,
+    ctx: {
+      logger: undefined,
+      tools: { register: (definition) => { tools.push(definition); return () => {} } },
+      inject: (deps, callback) => {
+        onInject(deps, callback)
+        return { dispose: () => {} }
+      },
+      effect: (callback) => callback(),
+    },
+  }
+}
+
+try {
+  check('the tool registers even when no Web connection is composed', () => {
+    const seen = []
+    // A headless profile has no `connection`, so the child fiber never runs —
+    // and the tool must still be there.
+    const { ctx, tools } = applyCtx({ onInject: (deps) => { seen.push(deps) } })
+    apply(ctx, { model: 'stub-model' })
+    assert.deepEqual(seen, [['connection']])
+    assert.equal(tools.length, 1)
+    assert.equal(tools[0].name, 'generate_image')
+    assert.equal(typeof tools[0].execute, 'function')
+    assert.equal(tools[0].timeoutMs, 300_000)
+  })
+
+  check('the Plugins-page routes mount when a Web connection is composed', () => {
+    const routes = []
+    let disposed = 0
+    const { ctx, tools } = applyCtx({
+      onInject: (_deps, callback) => {
+        callback({
+          // The child fiber is an ordinary context: services plus `effect`.
+          effect: (effect) => effect(),
+          connection: {
+            fetch: {
+              register: (route) => {
+                routes.push(route)
+                return () => { disposed += 1; return Promise.resolve() }
+              },
+            },
+          },
+        })
+      },
+    })
+    apply(ctx, { model: 'stub-model' })
+    assert.equal(tools.length, 1)
+    assert.deepEqual(routes.map(one => one.path), [
+      `${ROUTE_PREFIX}/status`,
+      `${ROUTE_PREFIX}/update`,
+      `${ROUTE_PREFIX}/test`,
+      `${ROUTE_PREFIX}/images`,
+      `${ROUTE_PREFIX}/image`,
+      `${ROUTE_PREFIX}/delete`,
+      `${ROUTE_PREFIX}/open`,
+      `${ROUTE_PREFIX}/reveal`,
+    ])
+    // The effect's disposer is what the fiber runs at teardown.
+    assert.equal(disposed, 0)
+  })
+} finally {
+  if (homeBeforeWiring === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = homeBeforeWiring
+  await rm(wiringDir, { recursive: true, force: true })
+}
+
+console.log('the browser half, loaded the way the client loader loads it')
+/**
+ * Run `client.js` in a VM the way the Web shell does — `window.__ModuleLoader__
+ * .load({ id, factory })` with a classic script — and drive the plugin it hands
+ * back. React is stubbed down to the hooks the components use, and `h` invokes
+ * function components eagerly, so a render here walks the whole tree. That
+ * proves the module body, the registration wiring, and that every surface
+ * renders its first state; DOM behaviour and the host round trip still need the
+ * GUI (see README「自检」).
+ */
+function loadBrowserHalf() {
+  let entry
+  const sandbox = {
+    window: { __ModuleLoader__: { load: (registered) => { entry = registered } } },
+    document: { baseURI: 'http://127.0.0.1:3080/' },
+    navigator: { language: 'zh-CN' },
+    fetch: async () => { throw new Error('the smoke test has no network') },
+    setTimeout,
+    clearTimeout,
+    console,
+    URL,
+  }
+  vm.createContext(sandbox)
+  vm.runInContext(readFileSync(new URL('./client.js', import.meta.url), 'utf8'), sandbox, { filename: 'client.js' })
+  assert.equal(entry.id, 'dsh-imagegen')
+  const h = (type, props, ...children) => {
+    const node = { type, props: props ?? {}, children }
+    return typeof type === 'function' ? type({ ...node.props, children }) : node
+  }
+  const react = {
+    createElement: h,
+    Fragment: Symbol('react.fragment'),
+    useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+    useEffect: () => {},
+    useMemo: (factory) => factory(),
+    useRef: (initial) => ({ current: initial }),
+    useCallback: (callback) => callback,
+  }
+  // `ui-primitives` is deliberately absent: the module must fall back to plain
+  // elements instead of failing to load, which is the whole point of its guard.
+  const moduleExports = entry.factory((specifier) => {
+    if (specifier === 'react') return react
+    if (specifier === 'react-dom') return { createPortal: (node) => node }
+    throw new Error(`unexpected require(${specifier})`)
+  })
+  return moduleExports
+}
+
+/** Every string a rendered tree carries, so assertions read as the reader does. */
+function textsOf(node, found = []) {
+  if (node === null || node === undefined || typeof node === 'boolean') return found
+  if (typeof node === 'string' || typeof node === 'number') {
+    found.push(String(node))
+    return found
+  }
+  if (Array.isArray(node)) {
+    for (const child of node) textsOf(child, found)
+    return found
+  }
+  if (typeof node === 'object' && 'children' in node) textsOf(node.children, found)
+  return found
+}
+
+const browserHalf = loadBrowserHalf()
+const registrations = []
+const browserCtx = {
+  get: () => undefined,
+  effect: (callback) => callback(),
+  slots: {
+    inject: (_name, run) => { run() },
+    register: (options, component) => {
+      registrations.push({ options, component })
+      return () => {}
+    },
+  },
+}
+browserHalf.apply(browserCtx)
+const registrationFor = (name) => registrations.find(one => one.options.name === name)
+const browserT = registrationFor('tool.call.toolview').options.inject().t
+
+check('the module registers under its package name and injects only slots', () => {
+  assert.deepEqual([...browserHalf.inject], ['slots'])
+  assert.equal(typeof browserHalf.apply, 'function')
+})
+check('it claims the tool card and both Plugins-page surfaces', () => {
+  assert.deepEqual(registrations.map(one => one.options.name), [
+    'tool.call.toolview',
+    'plugins.bundle.config',
+    'plugins.detail.section',
+  ])
+  assert.equal(registrationFor('tool.call.toolview').options.key, 'generate_image')
+  assert.equal(registrationFor('plugins.bundle.config').options.key, 'dsh-imagegen')
+  assert.equal(registrationFor('plugins.detail.section').options.id, 'imagegen-gallery')
+  assert.equal(typeof registrationFor('plugins.detail.section').options.order, 'number')
+  for (const one of registrations) assert.equal(typeof one.component, 'function')
+})
+check('every registration injects a translator that resolves real copy', () => {
+  for (const one of registrations) {
+    const injected = one.options.inject()
+    assert.equal(typeof injected.t, 'function')
+    const text = injected.t('config.baseUrl')
+    assert.equal(typeof text, 'string')
+    assert.notEqual(text, 'config.baseUrl')
+    assert.notEqual(text.length, 0)
+  }
+  // An unknown key falls back to the key itself rather than to undefined.
+  assert.equal(browserT('nope.missing'), 'nope.missing')
+  // Parameters interpolate, so a message can name what went wrong.
+  assert.equal(browserT('gallery.total', { shown: 3, total: 9 }).includes('3'), true)
+})
+check('the tool card renders its running state', () => {
+  const texts = textsOf(registrationFor('tool.call.toolview').component({
+    t: browserT,
+    block: { kind: 'tool-call' },
+    loadImage: () => Promise.resolve(''),
+  }))
+  assert.equal(texts.includes(browserT('card.generating')), true)
+})
+check('the settings section renders its loading state before the host answers', () => {
+  const texts = textsOf(registrationFor('plugins.bundle.config').component({ t: browserT }))
+  assert.equal(texts.includes(browserT('config.loading')), true)
+})
+check('the gallery renders only on this bundle’s own page', () => {
+  const section = registrationFor('plugins.detail.section').component
+  assert.equal(section({ t: browserT, subject: { kind: 'row', pkg: { name: 'dsh-imagegen' } } }), null)
+  assert.equal(section({ t: browserT, subject: { kind: 'bundle', pkg: { name: 'other-plugin' } } }), null)
+  assert.equal(section({ t: browserT, subject: undefined }), null)
+  const texts = textsOf(section({ t: browserT, subject: { kind: 'bundle', pkg: { name: 'dsh-imagegen' } } }))
+  assert.equal(texts.includes(browserT('gallery.title')), true)
+  // Nothing is indexed yet, so it opens on the state it can render immediately.
+  assert.equal(texts.includes(browserT('gallery.loading')), true)
+})
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) process.exitCode = 1

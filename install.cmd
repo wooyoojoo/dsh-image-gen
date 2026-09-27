@@ -43,7 +43,7 @@ exit /b %ERRORLEVEL%
       ② 代理：本机若开了 Windows 系统代理（浏览器能上 GitHub、git 却连不上，因为 git 不读系统代理设置），
          自动读注册表拿地址，**只对本次命令设 HTTP(S)_PROXY，不改你的全局 git 配置**。
       ③ 安装/更新插件（从 GitHub 装进指定 profile）。
-      ④ 离线自检：跑插件自带的 smoke（31 项，不联网、不花额度）。
+      ④ 离线自检：跑插件自带的 smoke（68 项，不联网、不花额度）。
       ⑤ 组合树自检：pnpm dsh --profile <p> --dump-config 里应能看到 imagegen 层。最后提示重启 DSH。
 
     参数：

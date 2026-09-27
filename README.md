@@ -43,7 +43,7 @@
 （第一次给了 `-DshDir` 之后会记在 `$DSH_HOME/imagegen-install.json`，**以后在哪跑都不用再给参数**）；
 ② **自动套用 Windows 系统代理**（浏览器能上 GitHub 而 git 不能，就是因为它不读系统代理设置 ——
 脚本只对本次命令设 `HTTP(S)_PROXY`，**不改你的全局 git 配置**）；③ 装/更新插件；
-④ 跑插件自带的**离线 smoke（31 项）**；⑤ 再跑 `--dump-config` 确认 profile 组合树里 `imagegen` 层在位。
+④ 跑插件自带的**离线 smoke（68 项）**；⑤ 再跑 `--dump-config` 确认 profile 组合树里 `imagegen` 层在位。
 最后提示你**重启 DSH**。双击运行时窗口默认**暂停**等你按回车（否则跑完就关、看不到结果）。
 
 > 非 Windows（macOS/Linux）用不了 `.cmd`：要么把内嵌的 PowerShell 段抽出来用 `pwsh` 跑，
@@ -64,8 +64,8 @@ pnpm dsh plugin --profile web add <plugin-source-dir>
 
 # ③ 或用 tarball（最稳，适合拷到离线机器）
 cd <plugin-source-dir>
-pnpm pack                                     # 产出 dsh-imagegen-0.2.1.tgz
-pnpm dsh plugin --profile web add <plugin-source-dir>\dsh-imagegen-0.2.1.tgz
+pnpm pack                                     # 产出 dsh-imagegen-0.3.0.tgz
+pnpm dsh plugin --profile web add <plugin-source-dir>\dsh-imagegen-0.3.0.tgz
 ```
 
 `<plugin-source-dir>` 是源码目录；**本机当前克隆在** `D:\Git\dsh-image-gen`（历史：`~/.dsh/imagegen-src/dsh-imagegen` 是最早那份，原先的 `D:\Git\deepseek-harness\scratch-plugin\dsh-imagegen` 已删除，且那个路径**不在** harness 仓库的 `.gitignore` 里，别再往 harness 里放）。
@@ -80,11 +80,18 @@ pnpm dsh plugin --profile img add github:wooyoojoo/dsh-image-gen#<sha>
 pnpm dsh --profile img
 ```
 
-改代码时用 overlay（`web` profile 会实时重载 patch **文件**；改 `index.js` 本身要重启 —— 内置组合里 `cordis-plugin-hmr` 是 disabled 的）：
+改代码时怎么看到效果（`web` profile 会实时重载 patch **文件**，但改 `index.js` / `client.js` 本身要重启 —— 内置组合里 `cordis-plugin-hmr` 是 disabled 的）：
 
 ```powershell
-pnpm dsh web --patch ./scratch-plugin/cordis.yml
+# ① 只改 profile 的 patch 文件（config 覆盖之类）：存盘即生效，不用重启
+#    $DSH_HOME/profiles/web/cordis.patch.yml
+
+# ② 改了 index.js / client.js：重启一次即可（链接安装下读到的是源目录的文件）
+pnpm dsh web
 ```
+
+想在改插件源码时立刻看到效果，就得用**链接安装**（`pnpm dsh plugin --profile web add D:\Git\dsh-image-gen`）；
+git 与 tarball 装进去的都是打包快照，改完要重新 pack + 重装（见下一节）。
 
 ### 改了源码之后怎么刷新已安装的副本
 
@@ -93,7 +100,7 @@ pnpm dsh web --patch ./scratch-plugin/cordis.yml
 ```powershell
 cd D:\Git\dsh-image-gen
 pnpm pack
-pnpm dsh plugin --profile web add .\dsh-imagegen-0.2.1.tgz
+pnpm dsh plugin --profile web add .\dsh-imagegen-0.3.0.tgz
 ```
 
 profile 的 `package.json` 记的是 tarball 的**绝对路径**，所以别删或移动那个 `.tgz`，否则 profile 里再跑 `pnpm install` 会失败（已经装好的副本不受影响，照常启动）。想省掉这一步就用链接安装：`pnpm dsh plugin --profile web add D:\Git\dsh-image-gen`，代价是**源目录不能搬走**，搬了 profile 会加载失败。
@@ -123,6 +130,49 @@ IMAGE_API_KEY=sk-...
 | `https://relay.example.com/v1/images/generations` | 原样使用 |
 | 上面任一写法 + 调用时给了 `image` | 同一个 base，尾段换成 `…/images/edits`（含"粘的是完整 generations 地址"那种写法） |
 
+## 在 DSH 的「插件」页里管理
+
+侧边栏「插件」→ 打开 **dsh-imagegen** 这一项，页面上有两块：
+
+**① 配置区**（`plugins.bundle.config`）
+
+| 控件 | 写到哪里 | 生效时机 |
+|---|---|---|
+| 请求地址、API KEY | 凭据存储 `~/.dsh/.credentials.yaml` | **下一次调用**，不用重启 |
+| 模型 / 尺寸 / 质量 / 超时 / 输出目录 | `$DSH_HOME/imagegen/config.json` | **下一次调用**，不用重启 |
+| （按钮）测试连接 | 不发请求给模型，只 `GET {base}/v1/models` | 立即 |
+
+优先级：**插件页覆盖 > cordis 配置 > 内置默认**。每个字段下面都会写明它现在来自哪一层：
+
+- 地址 / KEY 来自**启动环境变量**时显示**只读** —— 凭据面拒绝写入被启动环境遮住的值，硬写只会让人误会。
+- 地址 / KEY 被 profile 的 `config:` 固定住时同样只读，并直接说明「改 profile patch」。
+- 五个覆盖字段显示「已在插件页覆盖」或「来自 profile 配置或内置默认」；**清空该输入框再保存 = 恢复下层值**。
+- KEY **永远不回显**：只显示「已配置 / 未配置」，留空表示不修改。有已保存的 KEY 且可写时，多一个「清除已保存的 KEY」。
+
+「测试连接」为什么是 `/v1/models`：这是能同时证明地址和 KEY 都通的最便宜请求。中继只实现图片端点、
+不实现 `/models` 时会返回 404/405，这时界面会**明确说"探测无法判定"**而不是报失败 —— 那种情况下
+请直接生成一张图来确认。
+
+**② 已生成图片画廊**（`plugins.detail.section`，同一页往下滚）
+
+每次生成都会往 `$DSH_HOME/imagegen/images.json` 追加一条记录（prompt、模型、尺寸、质量、模式、
+输入图、字节、宽高、附件 id），画廊就按它倒序列出，每张图可以：
+
+- **点击放大** —— 灯箱预览（复用仓库 UI 原语那套缩略图尺寸规则）
+- **打开** —— 交给系统默认应用
+- **定位** —— 在文件管理器中选中（Windows `explorer /select`，macOS `open -R`，Linux `xdg-open`）
+- **复制路径**
+- **再次编辑** —— 把 `{"prompt": …, "image": […]}` 这段 `generate_image` 参数复制到剪贴板，
+  粘回输入框再说明要改什么（插件页不能替你调模型，这是刻意的）
+- **删除** —— 两步确认，删文件 + 删索引记录，不可撤销
+
+图片按 **id** 取，不接受路径：`GET /api/imagegen/image?id=…` 只服务索引里登记过的记录，
+所以页面无法借这个插件读任意文件。索引最多保留最新 500 条，更早的文件留在磁盘上但不再列出。
+
+> 这一页的所有请求都走 `/api/imagegen/*`，位于连接层的认证围栏之下 —— 未认证请求拿到 401。
+> `connection` 是**可选**依赖（挂在子 fiber 上），所以在没有 Web 组合的 headless profile 里，
+> 工具照常注册，只是没有这些路由。
+
 ## 配置字段
 
 | 字段 | 默认 | 说明 |
@@ -138,6 +188,10 @@ IMAGE_API_KEY=sk-...
 | `outputFormat` | 不传 | 透传字段的默认值（`png`/`jpeg`/`webp`），落成请求里的 `output_format` |
 | `timeoutMs` | `300000` | 单次调用预算。生图常见 30–120 秒，别调太小 |
 | `outputDir` | `process.cwd()` | 图片保存目录，自动创建 |
+
+其中 `model`、`size`、`quality`、`timeoutMs`、`outputDir` 五个可以直接在插件页改（见上一节），
+值写进插件自己的覆盖文件，**优先级高于这张表里的 cordis 配置**；`baseUrl` / `apiKey` 也能在插件页改，
+但写的是凭据存储而不是这一层。每个字段在页面上都会标明当前来自哪一层。
 
 要固定某台设备的值，在 `$DSH_HOME/profiles/<name>/cordis.patch.yml` 里按 `id` 覆盖这一行 —— **覆盖是整行替换 config，不深合并**，必须重述该行所有键：
 
@@ -226,6 +280,12 @@ ctx.slots.inject('tool.call.toolview', () => ctx.slots.register(
 
 卡片用 `props.loadImage(attachment)` 换成 object URL 自己渲染 `<img>` —— **不声明 `tool.call.images` 子槽**（那个已被 `read_image` 占用，第二个声明会在加载时抛错，等于启动失败）。
 
+这一份 `client.js` 一共认领三个键：上面这个工具卡片，加上插件页的 `plugins.bundle.config`
+（key = `dsh-imagegen`，配置区）和 `plugins.detail.section`（图片画廊，只在 subject 是本 bundle 时渲染）。
+后两个是 `ui-plugin-manager`（侧边栏「插件」页）声明的槽位，它的注释写明「带自己配置的插件就在这一页渲染」，
+所以第三方 bundle 不用改 DSH 就能把自己挂上去。控件来自 shell 预置的 `ui-primitives`
+（`Button` / `Input` / `Tag` 等，见「共享模块」那段），拿不到时自动退回等价的原生元素。
+
 `client.js` 是**手写的产物、没有构建步骤**：浏览器端只执行 `window.__ModuleLoader__.load({ id, factory })` 这种 classic script，格式就是仓库里 `packages/client/tsdown.client.ts` 产出的那套（banner + factory），所以脱离仓库也能零工具链发布。代价是要写 `React.createElement` 而不是 JSX，且不能用仓库的 tsdown 预置。
 
 认领了这个键，这个工具的**所有**状态就都由这张卡片负责（包括进行中和失败），所以卡片同时处理 running / 无附件 / 加载失败三种情况。卡片里少量文案是硬编码英文，没走仓库的 locale 字典 —— 那是 `verify-client-ui-i18n` 管的事，这个包不在该门禁范围内。
@@ -239,26 +299,41 @@ cd <本包目录>
 node smoke.mjs          # 或 pnpm test
 ```
 
-覆盖：端点解析（含 generations ↔ edits 推导）、参数校验（`image`/`mask`/`background`+`jpeg` 冲突/`extra` 合并/未知参数拒绝）、两种请求体构造，以及**对本地 stub 服务真跑一遍 `execute`**（JSON 与 multipart 两条路 + 落盘字节比对 + 读不到文件/非图片的报错）。共 31 项。
+覆盖（**68 项**）：
 
-> ⚠️ 这一版只覆盖**服务端半边**（`index.js`）。原先 `scratch-plugin/` 里那份 smoke 还会把 `client.js` 放进 VM、按模块加载器的方式执行并驱动卡片渲染；那份文件随源目录一起丢失了，**客户端半边目前只能靠启动 GUI 验证**。回迁到自己的仓库时建议补回来。
+- **纯函数**：端点解析（含 generations ↔ edits 推导）、参数校验（`image`/`mask`/`background`+`jpeg` 冲突/`extra` 合并/未知参数拒绝）、两种请求体构造。
+- **对本地 stub 服务真跑一遍 `execute`**：JSON 与 multipart 两条路 + 落盘字节比对 + 读不到文件/非图片的报错 + 索引记录内容。
+- **插件页那一面**：状态目录与覆盖文件的读写与清洗、凭据的写/清除/被启动环境遮挡时的拒绝、被 profile 固定时的拒绝、
+  图片索引、**全部 8 条路由**（含「按 id 而非路径取图」和「open/reveal 对未知 id 不启动任何进程」）、连通性探测的三种结果。
+- **客户端半边**：把 `client.js` 放进 `node:vm`、按模块加载器的方式执行（`window.__ModuleLoader__.load`），
+  用桩 React 驱动 `apply`，校验三处注册的名称/key/id 与译文字典，并渲染每个界面的首屏状态。
+  这同时证明了一件事：**拿不到 `ui-primitives` 时会退回原生元素而不是加载失败**。
+
+> ⚠️ 仍然没有被自动化覆盖的是**真实 DOM 里的交互**（点击、灯箱、剪贴板、文件管理器定位）——
+> 本机没有浏览器自动化，这部分只能在真实 GUI 里看。VM 覆盖到的是「模块能加载、注册正确、首屏能渲染」，
+> 也就是 realistically 会一次性把整页搞挂的那些失败模式。
+>
+> 跑 smoke **不需要** key、不需要 endpoint，也不会碰你真实的 `~/.dsh/imagegen`：
+> 它在开头就把 `DSH_HOME` 指向临时目录，结束时还原。
 
 升级 DSH 之后按顺序跑，哪步红就是哪层的问题：
 
-1. 上面的 smoke —— 插件本体行为，含客户端半边（在 VM 里按模块加载器的方式执行 `client.js`，驱动卡片渲染）
+1. 上面的 smoke —— 插件本体行为，含客户端半边的加载与首屏渲染
 2. `pnpm dsh --profile web --dump-config` —— 组合树仍能解析，`imagegen` 层还在
-3. 启动后让模型调一次 `generate_image`
+3. 启动后让模型调一次 `generate_image`，再打开插件页看一眼配置区与画廊
 
 改动 `client.js` 后要额外确认一件事：**客户端半边写坏会让整个 GUI 起不来**（`dsh.client` 声明了却找不到 `./client` 时，加载期就报错）。所以改完先跑 smoke，再单独启动一次 `dsh web` 确认能起来，最后才让 GUI 重启。
 
-第 1 步绿、第 2/3 步红，说明 DSH 侧的加载契约变了，改 `index.js` 里对应的调用即可（只有一个：`ctx.tools.register`）。
+第 1 步绿、第 2/3 步红，说明 DSH 侧的加载契约变了，改 `index.js` 里对应的调用即可：
+工具是 `ctx.tools.register`，插件页那两块是 `ctx.inject(['connection'], …)` 里的 `connection.fetch.register`
+和 `client.js` 里的三处 `ctx.slots.register`。
 
 ## 移植到其它设备
 
 ```powershell
 # tarball：最稳，不需要任何构建许可
 pnpm pack
-pnpm dsh plugin --profile web add .\dsh-imagegen-0.1.0.tgz
+pnpm dsh plugin --profile web add .\dsh-imagegen-0.3.0.tgz
 
 # git：可版本化，pin 到 tag 或 sha
 pnpm dsh plugin --profile web add github:<you>/dsh-imagegen#<sha>
@@ -275,7 +350,12 @@ pnpm dsh plugin --profile web add dsh-imagegen
 - **无构建步骤。** 纯 ESM JS，源码即产物：源检出、安装版 `dsh`、tarball 三种载体跑同一份文件。
 - **endpoint 和 key 都在调用时解析。** 自包含的错误（显式 baseUrl 格式错、config 字段类型错）在加载期就报错；只有凭据面能给的值留到调用时，因为它们本来就会轮换。
 - **凭据请求 `redirect: 'error'`。** 不把 `Bearer` 自动转发到别的 origin。
-- **不做 UI 卡片。** 内置 Web 端不消费 host presenter，加专门卡片要写 Client 插件，先保持最小依赖面。
+- **UI 挂在既有槽位上，不碰 DSH 源码。** 配置区与画廊认领的是 `ui-plugin-manager` 自己声明的
+  `plugins.bundle.config` / `plugins.detail.section`，控件来自 shell 预置的 `ui-primitives`（拿不到就退回原生元素）。
+  代价是样式只能用内联样式而不是 CSS Modules，文案走自己注册的 `ctx.locale` 命名空间而不是仓库的类型化字典。
+- **能改的值分两处存，各按各的语义来。** 地址和 KEY 交给凭据面（`set`/`unset`，有 watch、下一步调用就生效，
+  且 `describe` 从不回显密钥）；其余五个字段写插件自己的 JSON 覆盖文件。没有为了「统一」把密钥塞进配置文件。
+- **不给插件页开任意路径读取。** 图片只按索引里的 id 取，页面拿不到「读任意文件」的能力。
 
 ## 已知限制
 
@@ -283,5 +363,10 @@ pnpm dsh plugin --profile web add dsh-imagegen
 - **编辑的输入图只支持本地文件路径**（PNG/JPEG/WebP/GIF），不支持 DSH 附件 id；`mask` 一般要求与第一张图同尺寸同格式。
 - `background` / `seed` / `input_fidelity` / `extra` 是**盲透传**：插件不知道服务方认不认，报错原样带回来。
 - 结果以文件路径返回，看图要模型再调 `read_image`，而 `read_image` 要求当前路由模型声明图片输入。
-- 用 Node `fs` 直接写盘，不走 `ctx.fs` 的沙箱策略；写入位置完全由 `outputDir`（配置或单次参数）决定。
-- 客户端半边（`client.js`）本轮未改动，也就没有被 `smoke.mjs` 覆盖（见上一节）。
+- 用 Node `fs` 直接写盘，不走 `ctx.fs` 的沙箱策略；写入位置完全由 `outputDir`（配置、插件页覆盖或单次参数）决定。
+- **画廊没有真缩略图**：不引图像解码库，缩略图就是原图字节 + `loading="lazy"` + `private, max-age=31536000, immutable`。
+  一页 24 张时只请求可见的那几张，但输出目录里全是几 MB 的大图、又一次性列几百张时会比较费流量。
+- 索引最多保留最新 **500** 条；更早的图片仍在磁盘上，只是不再出现在画廊里（也不占索引体积）。
+- **插件页界面的交互行为没有自动化测试**（点击、灯箱、剪贴板、系统定位），只有加载与首屏渲染被 VM 覆盖；
+  真要改动它们，请在真实 GUI 里过一遍。
+- 只服务**生成流程写出来的**图片：手工放进输出目录的文件不会进索引，因而也不在画廊里。
