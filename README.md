@@ -6,12 +6,23 @@
 
 ## 装一次，之后什么都不用加
 
+仓库：**<https://github.com/wooyoojoo/dsh-image-gen>** —— 源码即产物，没有构建步骤，所以 git / tarball / 目录链接三种装法跑的是同一份文件。
+
 ```powershell
-cd D:\Git\deepseek-harness\scratch-plugin\dsh-imagegen
-pnpm pack                                     # 产出 dsh-imagegen-0.1.0.tgz
-cd D:\Git\deepseek-harness
-pnpm dsh plugin --profile web add .\scratch-plugin\dsh-imagegen\dsh-imagegen-0.1.0.tgz
+# ① 从 git 装（推荐：pin 到 sha，任何机器一条命令，不需要构建许可）
+pnpm dsh plugin --profile web add github:wooyoojoo/dsh-image-gen#<sha>
+
+# ② 或用本地源码目录（改完即生效 —— 用**链接安装**时才成立）
+pnpm dsh plugin --profile web add <plugin-source-dir>
+#    代价：源目录不能搬走，搬了 profile 会加载失败
+
+# ③ 或用 tarball（最稳，适合拷到离线机器）
+cd <plugin-source-dir>
+pnpm pack                                     # 产出 dsh-imagegen-0.2.0.tgz
+pnpm dsh plugin --profile web add <plugin-source-dir>\dsh-imagegen-0.2.0.tgz
 ```
+
+`<plugin-source-dir>` 是源码目录；**本机当前克隆在** `D:\Git\dsh-image-gen`（历史：`~/.dsh/imagegen-src/dsh-imagegen` 是最早那份，原先的 `D:\Git\deepseek-harness\scratch-plugin\dsh-imagegen` 已删除，且那个路径**不在** harness 仓库的 `.gitignore` 里，别再往 harness 里放）。
 
 装完之后就按你平时的方式启动 GUI，**不需要 `--patch`、不需要任何 flag**。工具在新会话里自动出现。
 
@@ -19,11 +30,11 @@ pnpm dsh plugin --profile web add .\scratch-plugin\dsh-imagegen\dsh-imagegen-0.1
 
 ```powershell
 pnpm dsh --profile img --from-default-profile web
-pnpm dsh plugin --profile img add .\scratch-plugin\dsh-imagegen\dsh-imagegen-0.1.0.tgz
+pnpm dsh plugin --profile img add github:wooyoojoo/dsh-image-gen#<sha>
 pnpm dsh --profile img
 ```
 
-改代码时用 overlay（`web` profile 会实时重载 patch **文件**；改 `index.js` 本身要重启，内置组合里 `cordis-plugin-hmr` 是 disabled 的）：
+改代码时用 overlay（`web` profile 会实时重载 patch **文件**；改 `index.js` 本身要重启 —— 内置组合里 `cordis-plugin-hmr` 是 disabled 的）：
 
 ```powershell
 pnpm dsh web --patch ./scratch-plugin/cordis.yml
@@ -31,16 +42,15 @@ pnpm dsh web --patch ./scratch-plugin/cordis.yml
 
 ### 改了源码之后怎么刷新已安装的副本
 
-装进 profile 的是**打包快照**，不是目录链接。改完 `index.js` 要重新 pack + 重装（建议同时把 `package.json` 的 version 加一位，避免 pnpm 按同版本跳过）：
+装进 profile 的是**打包快照**（git 与 tarball 都是），不是目录链接。改完 `index.js` 要重新 pack + 重装（建议同时把 `package.json` 的 version 加一位，避免 pnpm 按同版本跳过）：
 
 ```powershell
-cd D:\Git\deepseek-harness\scratch-plugin\dsh-imagegen
+cd D:\Git\dsh-image-gen
 pnpm pack
-cd D:\Git\deepseek-harness
-pnpm dsh plugin --profile web add .\scratch-plugin\dsh-imagegen\dsh-imagegen-0.1.1.tgz
+pnpm dsh plugin --profile web add .\dsh-imagegen-0.2.1.tgz
 ```
 
-profile 的 `package.json` 记的是 tarball 的**绝对路径**，所以别删或移动那个 `.tgz`，否则 profile 里再跑 `pnpm install` 会失败（已经装好的副本不受影响，照常启动）。想省掉这一步就用链接安装：`pnpm dsh plugin --profile web add .\scratch-plugin\dsh-imagegen`，代价是**源目录不能搬走**，搬了 profile 会加载失败。
+profile 的 `package.json` 记的是 tarball 的**绝对路径**，所以别删或移动那个 `.tgz`，否则 profile 里再跑 `pnpm install` 会失败（已经装好的副本不受影响，照常启动）。想省掉这一步就用链接安装：`pnpm dsh plugin --profile web add D:\Git\dsh-image-gen`，代价是**源目录不能搬走**，搬了 profile 会加载失败。
 
 ## 配置 API key 和 endpoint
 
@@ -57,7 +67,7 @@ IMAGE_API_KEY=sk-...
 
 **没配置也能正常启动**：工具照常出现在列表里，被调用时返回一条可操作的错误（说明该设哪个变量）。这是刻意的，和 `tool-web` 在 provider 不可用时的行为一致。
 
-`baseUrl` 解析规则——以下是四种写法都指向同一个端点：
+`baseUrl` 解析规则——以下是四种写法都指向同一个端点（`edits` 是同一个 base 的另一个尾段，粘贴任一端点的完整地址都能互相推导）：
 
 | 写法 | 结果 |
 |---|---|
@@ -65,6 +75,7 @@ IMAGE_API_KEY=sk-...
 | `https://relay.example.com/v1` | `…/v1/images/generations` |
 | `https://relay.example.com/openai/v1/` | `…/openai/v1/images/generations` |
 | `https://relay.example.com/v1/images/generations` | 原样使用 |
+| 上面任一写法 + 调用时给了 `image` | 同一个 base，尾段换成 `…/images/edits`（含"粘的是完整 generations 地址"那种写法） |
 
 ## 配置字段
 
@@ -76,7 +87,9 @@ IMAGE_API_KEY=sk-...
 | `apiKey` | 无 | 明文 key，仅调试；优先用 `apiKeyEnv` |
 | `model` | `gpt-image-2.5-flare` | 生图模型 id |
 | `size` | `1024x1024` | 传给接口的 `size` |
-| `quality` | 不传 | `low`/`medium`/`high`/`xhigh`/`max`/`auto`，不设就由服务方决定 |
+| `quality` | 不传 | 质量档。**本机中继只认 `low`/`medium`/`high`/`auto`（最高 `high`）** —— 传其它值会得到 `Invalid value: … Supported values are: …` 的 400。不传则由服务方决定（等于 `auto`） |
+| `background` | 不传 | 透传字段的**默认值**（如 `transparent`）。单次调用的 `background` 覆盖它 |
+| `outputFormat` | 不传 | 透传字段的默认值（`png`/`jpeg`/`webp`），落成请求里的 `output_format` |
 | `timeoutMs` | `300000` | 单次调用预算。生图常见 30–120 秒，别调太小 |
 | `outputDir` | `process.cwd()` | 图片保存目录，自动创建 |
 
@@ -97,7 +110,56 @@ IMAGE_API_KEY=sk-...
 - **决定"要不要生图"的模型**：你当前会话路由到的对话模型（DSH 里配的 DeepSeek 等）。它通过 **tool calling** 调用 `generate_image`，就像调用 `read_image`、`bash` 一样。
 - **真正画图的模型**：上面配置表里的 `model` 字段，默认 `gpt-image-2.5-flare`，由第三方接口执行。它不在任何模型选择器里，因为它不是对话模型。
 
-工具参数：`prompt`（必填）、`model`、`size`、`quality`、`n`（1–4）。
+## 工具参数
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `prompt` | string，必填 | 画什么；给了 `image` 时是"要改什么" |
+| `model` / `size` / `quality` | string | 与配置字段同名，单次调用覆盖 |
+| `n` | integer 1–4 | 一次出几张 |
+| `image` | string 或 string[] | **输入图路径**（本地文件）。给了任意一张就走 `…/images/edits`（multipart 上传），最多 8 张 |
+| `mask` | string | 可选遮罩路径：**透明区域**才是会被重画的地方。必须同时给 `image` |
+| `background` | string | 透传：`transparent` 要抠好的透明底（服务方支持才有效，通常配 png/webp） |
+| `output_format` | string | 透传：`png` / `jpeg` / `webp` |
+| `seed` | integer 或 string | 透传：服务方认 seed 时才有意义 |
+| `input_fidelity` | string | 透传：例如 `high`，让结果尽量贴近输入图 |
+| `extra` | object | **逃生口**：任意其它字段原样进请求体；同名时显式参数优先 |
+| `providerOptions` | object | `extra` 的别名；两个都给时 `extra` 优先 |
+| `outputDir` | string | 本次落盘目录；相对路径相对配置的 `outputDir` 解析 |
+
+两个例子：
+
+```jsonc
+// ① 纯文生图 → POST …/v1/images/generations（JSON body）
+{ "prompt": "a chubby grey fish hook, flat cartoon sticker, thick white outline",
+  "background": "transparent", "n": 2 }
+
+// ② 改图 → POST …/v1/images/edits（multipart：image + mask + 其余字段）
+{ "prompt": "keep the exact curve, make the metal arm 40% thicker",
+  "image": ["D:/art/hook.png"], "mask": "D:/art/hook-mask.png",
+  "input_fidelity": "high", "output_format": "png", "outputDir": "assets/generated" }
+```
+
+**为什么 `image` 是路径而不是附件 id**：本包只 import `node:` 内置模块，读附件要走 DSH 的附件服务，会把"零 `@deepseek-ai/dsh-*` 导入"这个取舍打破。所以输入图请先落到本地磁盘再传路径（相对路径相对进程工作目录解析）。
+
+**服务方差异**：`background` / `seed` / `input_fidelity` / `extra` 是**原样透传**——插件不判断服务方是否支持。若中转返回 4xx 且报文提到某个字段，那就是那一层不支持，去掉即可；`mask` 一般要求与第一张图同尺寸同格式。
+
+### 本机中继（`cf.api.fan` + `gpt-image-2.5-flare`）实测能力矩阵（2026-09）
+
+真打了 7 次调用量出来的，不是照文档推的。换中继或换模型请重测：
+
+| 能力 | 结果 |
+|---|---|
+| `background: "transparent"` | ✅ 真透明底（`alpha min=0`、四角全 0、不透明约 9%） |
+| `n` 1–4 / `outputDir` / `output_format`（png、webp）/ 非方形 `size` | ✅ 全部生效 |
+| `quality` | ✅ 生效，但**枚举只有 `low`/`medium`/`high`/`auto`（最高 `high`）**，且 `low` 降质明显（切割发毛、渐变起噪），只适合试形状 |
+| `image` → `/images/edits`（multipart 上传） | ✅ 可用；输入图的透明底会保留 |
+| `mask` | ⚠️ 能传上去，**但模型不听**：带/不带 mask 两次编辑的轮廓 IoU 是 0.888 vs 0.893 |
+| `extra` / `providerOptions` | ✅ 确实到达线上（`extra:{seed:1}` 与具名 `seed` 报同一条错） |
+| `seed` | ❌ `400 Unknown parameter: 'seed'`（generations 与 edits 都拒） |
+| `input_fidelity` | ❌ `400 … does not support the 'input_fidelity' parameter` |
+
+两条实践含义：**① 没有复现**——`seed` 不可用，要比较就同一次多出几张；**② 编辑不是"局部重绘"**——实测相似度约 IoU 0.89，是"同一主体重画一遍"，`input_fidelity` 与 `mask` 都救不了。要"只改一处、其余逐像素不变"，请用确定性的程序化处理（裁剪 / 改色 / 形态学加粗），而不是让模型改图。
 
 ## 会话里显示图片
 
@@ -127,8 +189,13 @@ ctx.slots.inject('tool.call.toolview', () => ctx.slots.register(
 离线（不需要 endpoint、不需要 key，网络被 stub 掉）：
 
 ```powershell
-node scratch-plugin/dsh-imagegen/smoke.mjs
+cd <本包目录>
+node smoke.mjs          # 或 pnpm test
 ```
+
+覆盖：端点解析（含 generations ↔ edits 推导）、参数校验（`image`/`mask`/`background`+`jpeg` 冲突/`extra` 合并/未知参数拒绝）、两种请求体构造，以及**对本地 stub 服务真跑一遍 `execute`**（JSON 与 multipart 两条路 + 落盘字节比对 + 读不到文件/非图片的报错）。共 31 项。
+
+> ⚠️ 这一版只覆盖**服务端半边**（`index.js`）。原先 `scratch-plugin/` 里那份 smoke 还会把 `client.js` 放进 VM、按模块加载器的方式执行并驱动卡片渲染；那份文件随源目录一起丢失了，**客户端半边目前只能靠启动 GUI 验证**。回迁到自己的仓库时建议补回来。
 
 升级 DSH 之后按顺序跑，哪步红就是哪层的问题：
 
@@ -166,7 +233,9 @@ pnpm dsh plugin --profile web add dsh-imagegen
 
 ## 已知限制
 
-- 只支持 OpenAI 兼容的 `POST {base}/v1/images/generations`；Gemini 原生（nano banana）需要另加请求/响应分支。
-- 只有文生图，没有 `/images/edits`（参考图、局部重绘、mask）。
+- 只支持 OpenAI 兼容的 `POST {base}/v1/images/generations` 与 `POST {base}/v1/images/edits`；Gemini 原生（nano banana）、以及各家私有形态仍需另加请求/响应分支。
+- **编辑的输入图只支持本地文件路径**（PNG/JPEG/WebP/GIF），不支持 DSH 附件 id；`mask` 一般要求与第一张图同尺寸同格式。
+- `background` / `seed` / `input_fidelity` / `extra` 是**盲透传**：插件不知道服务方认不认，报错原样带回来。
 - 结果以文件路径返回，看图要模型再调 `read_image`，而 `read_image` 要求当前路由模型声明图片输入。
-- 用 Node `fs` 直接写盘，不走 `ctx.fs` 的沙箱策略；写入位置完全由 `outputDir` 决定。
+- 用 Node `fs` 直接写盘，不走 `ctx.fs` 的沙箱策略；写入位置完全由 `outputDir`（配置或单次参数）决定。
+- 客户端半边（`client.js`）本轮未改动，也就没有被 `smoke.mjs` 覆盖（见上一节）。

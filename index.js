@@ -1,6 +1,18 @@
 /**
  * `generate_image`: OpenAI-compatible image generation for DeepSeek Harness.
  *
+ * Two endpoints are supported, chosen per call by the arguments:
+ *
+ *  - `POST {base}/v1/images/generations` — text to image (JSON body).
+ *  - `POST {base}/v1/images/edits` — text **plus input images** (multipart body):
+ *    pass `image` (one path, or several) and optionally `mask`, to keep an
+ *    existing picture and change only what the prompt asks for.
+ *
+ * Extra wire parameters are passed through without the plugin knowing them:
+ * `background`, `output_format`, `seed`, `input_fidelity`, and any other field
+ * via the `extra` / `providerOptions` object, which is merged into the request
+ * body (explicit fields win on a key collision).
+ *
  * This module imports only Node builtins. It registers its tool through
  * `ctx.tools.register()` with raw JSON Schema rather than importing
  * `defineTool`, so no `@deepseek-ai/dsh-*` package is resolved when the plugin
@@ -26,8 +38,8 @@
  * @module dsh-imagegen
  */
 
-import { mkdir, writeFile } from 'node:fs/promises'
-import { basename, join } from 'node:path'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { basename, extname, isAbsolute, join, resolve } from 'node:path'
 
 /** Cordis plugin name used by Loader diagnostics. */
 export const name = 'imagegen'
@@ -58,6 +70,16 @@ export const DEFAULT_TIMEOUT_MS = 300_000
 export const MAX_IMAGES = 4
 
 /**
+ * Largest number of input images one edit call may reference. Providers differ
+ * (some accept fewer), so this only bounds what one call may hand over.
+ */
+export const MAX_INPUT_IMAGES = 8
+
+/** Request kinds, each with its own endpoint and body encoding. */
+export const KIND_GENERATIONS = 'generations'
+export const KIND_EDITS = 'edits'
+
+/**
  * Whether generated images are attached to the tool result by default. An
  * attachment adds the image to the session timeline and sends it to the routed
  * model, which is a deployment choice: it costs visual tokens on an
@@ -75,15 +97,20 @@ const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
  * Resolve the absolute request URL from a configured base.
  *
  * The base may be a bare origin, an origin with a path prefix, a versioned API
- * root, or the complete endpoint; each resolves to one
- * `<…>/images/generations` URL. The rule is explicit so a pasted relay base
- * behaves predictably.
+ * root, the complete generations endpoint, or the complete edits endpoint; each
+ * resolves to one `<…>/images/<kind>` URL, so a base pasted from either
+ * endpoint's documentation works for both. The rule is explicit so a pasted
+ * relay base behaves predictably.
  *
  * @param baseUrl - API base, for example `https://relay.example.com/v1`.
+ * @param kind - `generations` (default) or `edits`.
  * @returns The absolute endpoint URL.
- * @throws When the value is not an absolute HTTP(S) URL.
+ * @throws When the value is not an absolute HTTP(S) URL, or the kind is unknown.
  */
-export function resolveEndpoint(baseUrl) {
+export function resolveEndpoint(baseUrl, kind = KIND_GENERATIONS) {
+  if (kind !== KIND_GENERATIONS && kind !== KIND_EDITS) {
+    throw new Error(`imagegen: unknown request kind ${JSON.stringify(kind)}`)
+  }
   let url
   try {
     url = new URL(baseUrl)
@@ -94,9 +121,13 @@ export function resolveEndpoint(baseUrl) {
     throw new Error(`imagegen: base URL must use http or https, got ${url.protocol}`)
   }
   const path = url.pathname.replace(/\/+$/u, '')
-  if (path.endsWith('/images/generations')) url.pathname = path
-  else if (path.endsWith('/v1')) url.pathname = `${path}/images/generations`
-  else url.pathname = `${path}/v1/images/generations`
+  if (/\/images\/(?:generations|edits)$/u.test(path)) {
+    url.pathname = path.replace(/\/images\/(?:generations|edits)$/u, `/images/${kind}`)
+  } else if (path.endsWith('/v1')) {
+    url.pathname = `${path}/images/${kind}`
+  } else {
+    url.pathname = `${path}/v1/images/${kind}`
+  }
   return url.toString()
 }
 
@@ -184,7 +215,7 @@ export function resolveConfig(config) {
   if (typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('imagegen: config must be an object')
   }
-  for (const field of ['baseUrl', 'model', 'size', 'quality', 'outputDir']) {
+  for (const field of ['baseUrl', 'model', 'size', 'quality', 'outputDir', 'background', 'outputFormat']) {
     if (raw[field] !== undefined && !isFilledString(raw[field])) {
       throw new Error(`imagegen: config.${field} must be a non-empty string when set`)
     }
@@ -202,14 +233,20 @@ export function resolveConfig(config) {
   }
   return {
     // An explicit base fails while the plugin loads, because a malformed one is
-    // self-contained; an absent one is resolved per call.
+    // self-contained; an absent one is resolved per call. The generations form
+    // is kept for callers that only ever generate; `baseUrl` lets an edit call
+    // derive its own endpoint from the same base.
     endpoint: raw.baseUrl === undefined ? undefined : resolveEndpoint(raw.baseUrl),
+    baseUrl: raw.baseUrl,
     baseUrlEnv,
     apiKeyEnv,
     apiKey: isFilledString(raw.apiKey) ? raw.apiKey : undefined,
     model: raw.model ?? DEFAULT_MODEL,
     size: raw.size ?? DEFAULT_SIZE,
     quality: raw.quality,
+    // Per-call defaults for the pass-through wire parameters; an argument wins.
+    background: raw.background,
+    outputFormat: raw.outputFormat,
     timeoutMs,
     attachImages: raw.attachImages ?? DEFAULT_ATTACH_IMAGES,
     outputDir: raw.outputDir ?? process.cwd(),
@@ -240,24 +277,56 @@ export async function resolveNamed(ctx, ref) {
  *
  * @param ctx - plugin context.
  * @param config - resolved config.
+ * @param kind - request kind, selecting the generations or edits endpoint.
  * @returns The absolute endpoint and the credential value.
  * @throws When either value is unavailable, naming where to put it.
  */
-export async function resolveTarget(ctx, config) {
-  const endpoint = config.endpoint ?? await resolveNamed(ctx, config.baseUrlEnv)
-  if (endpoint === undefined) {
+export async function resolveTarget(ctx, config, kind = KIND_GENERATIONS) {
+  const base = config.baseUrl ?? await resolveNamed(ctx, config.baseUrlEnv)
+  if (base === undefined) {
     throw new Error(`imagegen: no API base — set config.baseUrl, or store ${config.baseUrlEnv} (for example in ~/.dsh/.env, or as an exported environment variable)`)
   }
   const apiKey = config.apiKey ?? await resolveNamed(ctx, config.apiKeyEnv)
   if (apiKey === undefined) {
     throw new Error(`imagegen: no credential for ${config.apiKeyEnv} — store it (for example in ~/.dsh/.env, or as an exported environment variable) or set config.apiKey`)
   }
-  return { endpoint: config.endpoint ?? resolveEndpoint(endpoint), apiKey }
+  // The generations form is reused when configured, so a base that only ever
+  // generates keeps its exact previous endpoint string.
+  const endpoint = kind === KIND_GENERATIONS && config.endpoint !== undefined
+    ? config.endpoint
+    : resolveEndpoint(base, kind)
+  return { endpoint, apiKey }
+}
+
+/** Whether `value` is a plain object: not null, not an array. */
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * Normalize `image` (one path or several) into a bounded list of paths.
+ *
+ * @param value - the raw `image` argument, if any.
+ * @returns The input image paths.
+ * @throws When the list is empty, too long, or holds a non-string entry.
+ */
+function normalizeImages(value) {
+  if (value === undefined) return []
+  const list = Array.isArray(value) ? value : [value]
+  if (list.length === 0) throw new Error('imagegen: image must name at least one file')
+  if (list.length > MAX_INPUT_IMAGES) {
+    throw new Error(`imagegen: at most ${MAX_INPUT_IMAGES} input images are supported, got ${list.length}`)
+  }
+  for (const entry of list) {
+    if (!isFilledString(entry)) throw new Error('imagegen: every image entry must be a non-empty path string')
+  }
+  return list.map(entry => entry.trim())
 }
 
 /**
  * Validate the model-supplied arguments the raw parameter schema cannot
- * express: non-empty strings, the `n` bound, and unknown keys.
+ * express: non-empty strings, the `n` bound, the input-image list, the
+ * pass-through fields, and unknown keys.
  *
  * @param args - raw model arguments.
  * @param config - resolved config, supplying the per-call defaults.
@@ -268,7 +337,11 @@ export function parseArgs(args, config) {
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
     throw new Error('imagegen: arguments must be an object')
   }
-  const known = ['prompt', 'model', 'size', 'quality', 'n']
+  const known = [
+    'prompt', 'model', 'size', 'quality', 'n',
+    'image', 'mask', 'background', 'output_format', 'seed', 'input_fidelity',
+    'extra', 'providerOptions', 'outputDir',
+  ]
   const unknown = Object.keys(args).filter(key => !known.includes(key))
   if (unknown.length > 0) throw new Error(`imagegen: unknown argument(s) ${unknown.join(', ')}`)
   if (!isFilledString(args.prompt)) throw new Error('imagegen: prompt must be a non-empty string')
@@ -276,10 +349,27 @@ export function parseArgs(args, config) {
   if (!Number.isInteger(n) || n < 1 || n > MAX_IMAGES) {
     throw new Error(`imagegen: n must be an integer from 1 to ${MAX_IMAGES}`)
   }
-  for (const field of ['model', 'size', 'quality']) {
+  for (const field of ['model', 'size', 'quality', 'mask', 'background', 'output_format', 'input_fidelity', 'outputDir']) {
     if (args[field] !== undefined && !isFilledString(args[field])) {
       throw new Error(`imagegen: ${field} must be a non-empty string when set`)
     }
+  }
+  for (const field of ['extra', 'providerOptions']) {
+    if (args[field] !== undefined && !isPlainObject(args[field])) {
+      throw new Error(`imagegen: ${field} must be an object when set`)
+    }
+  }
+  if (args.seed !== undefined && !(Number.isInteger(args.seed) || isFilledString(args.seed))) {
+    throw new Error('imagegen: seed must be an integer or a string when set')
+  }
+  const images = normalizeImages(args.image)
+  if (images.length === 0 && args.mask !== undefined) {
+    throw new Error('imagegen: mask needs at least one image')
+  }
+  const background = args.background ?? config.background
+  const outputFormat = args.output_format ?? config.outputFormat
+  if (background === 'transparent' && outputFormat === 'jpeg') {
+    throw new Error('imagegen: background "transparent" cannot be combined with output_format "jpeg" — use png or webp')
   }
   return {
     prompt: args.prompt,
@@ -287,7 +377,135 @@ export function parseArgs(args, config) {
     model: args.model ?? config.model,
     size: args.size ?? config.size,
     quality: args.quality ?? config.quality,
+    images,
+    mask: args.mask,
+    background,
+    outputFormat,
+    seed: args.seed,
+    inputFidelity: args.input_fidelity,
+    extra: { ...args.providerOptions, ...args.extra },
+    outputDir: args.outputDir,
   }
+}
+
+/**
+ * Which endpoint a validated request needs.
+ *
+ * @param request - validated request fields.
+ * @returns `edits` when input images are present, else `generations`.
+ */
+export function requestKind(request) {
+  return request.images.length > 0 ? KIND_EDITS : KIND_GENERATIONS
+}
+
+/**
+ * The scalar wire fields both endpoints accept.
+ *
+ * `extra` comes first so an explicitly named argument wins a key collision, and
+ * a field the caller never named is simply absent rather than null.
+ *
+ * @param request - validated request fields.
+ * @returns The wire fields, still holding `undefined` for absent ones.
+ */
+export function scalarFields(request) {
+  const fields = {
+    ...request.extra,
+    model: request.model,
+    prompt: request.prompt,
+    n: request.n,
+    size: request.size,
+  }
+  if (request.quality !== undefined) fields.quality = request.quality
+  if (request.background !== undefined) fields.background = request.background
+  if (request.outputFormat !== undefined) fields.output_format = request.outputFormat
+  if (request.seed !== undefined) fields.seed = request.seed
+  if (request.inputFidelity !== undefined) fields.input_fidelity = request.inputFidelity
+  return fields
+}
+
+/**
+ * Build the JSON body for `POST /images/generations`.
+ *
+ * @param request - validated request fields.
+ * @returns The request body.
+ */
+export function buildGenerationBody(request) {
+  return scalarFields(request)
+}
+
+/**
+ * Append the scalar fields to a multipart form.
+ *
+ * Multipart values are strings, so a structured `extra` value is JSON-encoded
+ * rather than dropped.
+ *
+ * @param form - the FormData being built.
+ * @param request - validated request fields.
+ * @returns The same form, for chaining.
+ */
+export function appendEditFields(form, request) {
+  for (const [key, value] of Object.entries(scalarFields(request))) {
+    if (value === undefined) continue
+    form.append(key, typeof value === 'string' ? value : JSON.stringify(value))
+  }
+  return form
+}
+
+/**
+ * Resolve the directory one call writes into.
+ *
+ * @param requested - the call's `outputDir`, if any.
+ * @param fallback - the configured default.
+ * @returns An absolute directory path.
+ */
+export function resolveOutputDir(requested, fallback) {
+  if (requested === undefined) return fallback
+  return isAbsolute(requested) ? requested : resolve(fallback, requested)
+}
+
+/**
+ * Read one local image and append it as a multipart file part.
+ *
+ * The part's filename carries the sniffed extension, which is how the provider
+ * learns the format when the bytes alone are ambiguous.
+ *
+ * @param form - the FormData being built.
+ * @param field - `image` or `mask`.
+ * @param path - local file path.
+ * @param index - 1-based image index; 0 for a mask, which needs no number.
+ * @throws When the file is unreadable or is not a recognised image format.
+ */
+async function appendImageFile(form, field, path, index) {
+  let bytes
+  try {
+    bytes = await readFile(path)
+  } catch (error) {
+    throw new Error(`imagegen: cannot read ${field} file ${JSON.stringify(path)}: ${error.message}`)
+  }
+  const { mimeType, extension } = sniffImageType(bytes)
+  if (mimeType === 'application/octet-stream') {
+    throw new Error(`imagegen: ${JSON.stringify(path)} is not a PNG/JPEG/WebP/GIF image`)
+  }
+  const stem = basename(path, extname(path)) || field
+  const name = index > 0 ? `${index}-${stem}${extension}` : `${stem}${extension}`
+  form.append(field, new Blob([bytes], { type: mimeType }), name)
+}
+
+/**
+ * Append the input images and the optional mask to a multipart form.
+ *
+ * @param form - the FormData being built.
+ * @param request - validated request fields.
+ * @returns The same form, for chaining.
+ */
+async function appendEditParts(form, request) {
+  for (const [index, path] of request.images.entries()) {
+    await appendImageFile(form, 'image', path, index + 1)
+  }
+  if (request.mask !== undefined) {
+    await appendImageFile(form, 'mask', request.mask, 0)
+  }
+  return form
 }
 
 /**
@@ -302,17 +520,24 @@ export function parseArgs(args, config) {
  * @throws On transport failure, a non-2xx status, or an unreadable body.
  */
 async function requestImages(endpoint, apiKey, request, timeoutMs, signal) {
-  const body = { model: request.model, prompt: request.prompt, n: request.n, size: request.size }
-  if (request.quality !== undefined) body.quality = request.quality
-  // No `response_format`: current gpt-image models reject it, and both response
-  // forms are read below.
+  const headers = { authorization: `Bearer ${apiKey}` }
+  let body
+  if (requestKind(request) === KIND_EDITS) {
+    // Multipart: `fetch` writes the boundary itself, so no content-type here.
+    const form = new FormData()
+    await appendEditParts(form, request)
+    appendEditFields(form, request)
+    body = form
+  } else {
+    headers['content-type'] = 'application/json'
+    // No `response_format`: current gpt-image models reject it, and both
+    // response forms are read below.
+    body = JSON.stringify(buildGenerationBody(request))
+  }
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
+    headers,
+    body,
     signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
     // A credentialed request must not follow a redirect to another origin.
     redirect: 'error',
@@ -402,7 +627,8 @@ async function attachImage(ctx, config, bytes, mediaType, path) {
  * @returns One line per saved file.
  */
 export function renderResult(value) {
-  const lines = [`Generated ${value.images.length} image(s) with ${value.model}:`]
+  const via = value.mode === KIND_EDITS ? ` (edited from ${value.inputImages ?? 'the input image(s)'})` : ''
+  const lines = [`Generated ${value.images.length} image(s) with ${value.model}${via}:`]
   for (const image of value.images) {
     lines.push(`- ${image.path} (${image.mimeType}, ${image.bytes} bytes)`)
   }
@@ -449,17 +675,50 @@ export function renderContent(value) {
 export function defineGenerateImage(ctx, config) {
   return {
     name: 'generate_image',
-    description: 'Generate one or more images from a text prompt with a third-party image model, and save them as files. '
+    description: 'Generate or edit one or more images with a third-party image model, and save them as files. '
+      + 'Pass `image` (a local path, or several) to keep an existing picture and change only what the prompt asks for — that switches the call to the provider\'s edit endpoint. '
+      + '`mask`, `background`, `output_format`, `seed`, and `input_fidelity` are passed through when the provider understands them, and any other provider field goes into `extra`. '
       + 'Use read_image on a saved path to look at the result before iterating.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        prompt: { type: 'string', description: 'The image to generate.' },
+        prompt: { type: 'string', description: 'The image to generate, or the change to make when image is given.' },
         model: { type: 'string', description: `Image model id. Defaults to ${DEFAULT_MODEL}.` },
         size: { type: 'string', description: `Image size such as 1024x1024. Defaults to ${DEFAULT_SIZE}.` },
         quality: { type: 'string', description: 'Provider quality level, for example low, medium, high, or auto.' },
         n: { type: 'integer', description: `How many images to generate, 1 to ${MAX_IMAGES}. Defaults to 1.` },
+        image: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Local path(s) of the image(s) to edit. A bare path string is also accepted. '
+            + 'Giving any image switches the call to the edits endpoint (multipart upload).',
+        },
+        mask: {
+          type: 'string',
+          description: 'Optional local mask path for an edit: the transparent area is what gets regenerated. Requires image.',
+        },
+        background: {
+          type: 'string',
+          description: 'Pass-through: "transparent" asks for a cut-out background where the provider supports it (png/webp output).',
+        },
+        output_format: { type: 'string', description: 'Pass-through: png, jpeg, or webp where the provider supports it.' },
+        seed: { type: 'integer', description: 'Pass-through: seed, for providers that honour one.' },
+        input_fidelity: { type: 'string', description: 'Pass-through: for example "high" to stay close to the input image.' },
+        extra: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Any other provider field, merged into the request body. An explicitly named argument wins a key collision.',
+        },
+        providerOptions: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Alias of `extra`; `extra` wins when both are set.',
+        },
+        outputDir: {
+          type: 'string',
+          description: 'Directory for the saved files. Defaults to the configured outputDir; a relative path resolves against it.',
+        },
       },
       required: ['prompt'],
     },
@@ -488,6 +747,8 @@ export function defineGenerateImage(ctx, config) {
             },
           },
           revisedPrompt: { type: 'string' },
+          mode: { type: 'string' },
+          inputImages: { type: 'array', items: { type: 'string' } },
         },
         required: ['model', 'images'],
       },
@@ -498,9 +759,11 @@ export function defineGenerateImage(ctx, config) {
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const request = parseArgs(args, config)
-      const { endpoint, apiKey } = await resolveTarget(ctx, config)
+      const kind = requestKind(request)
+      const { endpoint, apiKey } = await resolveTarget(ctx, config, kind)
       const { entries, revisedPrompt } = await requestImages(endpoint, apiKey, request, config.timeoutMs, exec.signal)
-      await mkdir(config.outputDir, { recursive: true })
+      const outputDir = resolveOutputDir(request.outputDir, config.outputDir)
+      await mkdir(outputDir, { recursive: true })
       const stem = outputStem()
       const images = []
       for (const [index, entry] of entries.entries()) {
@@ -509,16 +772,17 @@ export function defineGenerateImage(ctx, config) {
           : await downloadImage(entry, exec.signal)
         if (bytes.length === 0) throw new Error(`imagegen: image ${index + 1} decoded to zero bytes`)
         const { mimeType, extension } = sniffImageType(bytes)
-        const path = join(config.outputDir, `${stem}-${index + 1}${extension}`)
+        const path = join(outputDir, `${stem}-${index + 1}${extension}`)
         await writeFile(path, bytes)
         const attachment = await attachImage(ctx, config, bytes, mimeType, path)
         images.push(attachment === undefined
           ? { path, mimeType, bytes: bytes.byteLength }
           : { path, mimeType, bytes: bytes.byteLength, ...attachment })
       }
-      return revisedPrompt === undefined
-        ? { model: request.model, images }
-        : { model: request.model, images, revisedPrompt }
+      const result = { model: request.model, mode: kind, images }
+      if (request.images.length > 0) result.inputImages = request.images
+      if (revisedPrompt !== undefined) result.revisedPrompt = revisedPrompt
+      return result
     },
   }
 }
