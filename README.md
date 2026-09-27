@@ -28,6 +28,17 @@
 - PowerShell 5.1 把**无 BOM** 的 `.ps1` 按 ANSI 解码，中文串会乱到破坏语法解析（报的却是"缺闭合括号"，极易误诊）。
   这个文件把 PowerShell 代码**内嵌**在 `.cmd` 里，运行时用 `[IO.File]::ReadAllText`（.NET 默认 UTF-8）读自己再执行 → **BOM 这件事彻底不用管**。
 
+> ⚠️ **这个文件必须保持 CRLF 行尾**：LF-only 的批处理会被 `cmd.exe` 错位解析（实测报 `+$m.Length)))" -Help was unexpected at this time`）。
+> 所以 `.gitattributes` 里钉了 `*.cmd text eol=crlf`，而且**安装器故意不放进 npm 包** ——
+> pnpm 物化 git 依赖时会把行尾写成 LF，那样包里就会是一份跑不起来的副本。
+> **用法就是把它 clone 下来再跑**（仓库检出里一定是 CRLF）：
+>
+> ```powershell
+> git clone https://github.com/wooyoojoo/dsh-image-gen
+> cd dsh-image-gen
+> .\install.cmd
+> ```
+
 脚本做五件事：① 找 DSH 检出目录：`-DshDir` → 环境变量 `DSH_DIR` → **上次记住的** → 从当前目录向上搜
 （第一次给了 `-DshDir` 之后会记在 `$DSH_HOME/imagegen-install.json`，**以后在哪跑都不用再给参数**）；
 ② **自动套用 Windows 系统代理**（浏览器能上 GitHub 而 git 不能，就是因为它不读系统代理设置 ——

@@ -1,0 +1,7 @@
+# 批处理对行尾敏感：LF-only 的 .cmd 会被 cmd.exe 的按块读取错位解析
+# （实测报错形如 `"+$m.Length)))" -Help was unexpected at this time.`）。
+# 强制 checkout / archive / pack 出来都是 CRLF。
+*.cmd text eol=crlf
+
+# 其余文本按仓库内 LF 存储，检出时随各平台惯例
+* text=auto

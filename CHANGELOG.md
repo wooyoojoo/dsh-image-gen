@@ -12,8 +12,10 @@
   - 自动向上搜索 DSH 目录并**记住**（`$DSH_HOME/imagegen-install.json`），所以第一次给过 `-DshDir` 之后**零参数**即可；
     **自动套用 Windows 系统代理**（只对本次命令设 `HTTP(S)_PROXY`，不改全局 git 配置）；
     装完跑离线 smoke（31 项）+ `--dump-config` 复核；默认**暂停**以便双击时看到结果（`-NoPause` 关闭）。
-- `files` 纳入 `install.cmd`，tarball 自带走更新入口。
-- README 增加「一键安装 / 更新」章节。
+- `files` 纳入 ~~`install.cmd`~~ → **最终不纳入**：pnpm 物化 git 依赖时把行尾写成 LF，
+  而 LF-only 的批处理会被 `cmd.exe` 错位解析（实测 `+$m.Length)))" -Help was unexpected at this time`）。
+  安装器改为"从 clone 出来的仓库里跑"，并用 `.gitattributes`（`*.cmd text eol=crlf`）钉住行尾。
+- README 增加「一键安装 / 更新」章节（含 clone + 跑脚本的新设备流程）。
 
 ## 0.2.0 — 2026-09-27
 

@@ -18,8 +18,7 @@
     "client.js",
     "cordis.patch.yml",
     "README.md",
-    "smoke.mjs",
-    "install.cmd"
+    "smoke.mjs"
   ],
   "dsh": {
     "bundle": {

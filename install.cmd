@@ -19,6 +19,14 @@ rem      For usage text:  install.cmd -Help
 rem
 rem  The split marker below is located with LastIndexOf on purpose: this header
 rem  may mention it, and only the real marker line must win.
+rem
+rem  KEEP THIS FILE CRLF. A batch file with LF-only endings is parsed wrong by
+rem  cmd.exe (its block reads assume CRLF, so it seeks mid-line and reports
+rem  garbage such as: +$m.Length)))" -Help was unexpected at this time). That is
+rem  also why .gitattributes pins "*.cmd text eol=crlf", and why this installer is
+rem  deliberately NOT shipped inside the npm package: pnpm materialises a git
+rem  dependency with LF endings, which would ship a broken copy of this file.
+rem  Run it from a repo checkout (git clone), where CRLF is guaranteed.
 rem ===========================================================================
 setlocal
 set "PS=powershell"
