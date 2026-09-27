@@ -11,15 +11,22 @@
 ### 一键安装 / 更新（推荐）
 
 ```powershell
-# 装或更新到最新（幂等：重复跑就是更新）
-pwsh -File install.ps1
+# 装或更新到最新（幂等：重复跑就是更新）—— 双击 install.cmd 也行
+.\install.cmd
 
 # 常用变体
-pwsh -File install.ps1 -Profile img                 # 装到别的 profile
-pwsh -File install.ps1 -Ref b398714                 # 固定到某个 sha（可复现）
-pwsh -File install.ps1 -DshDir D:\Git\deepseek-harness   # DSH 检出目录不在上层时显式指定
-pwsh -File install.ps1 -Proxy http://127.0.0.1:20368     # 手动指定代理
+.\install.cmd -Profile img                 # 装到别的 profile
+.\install.cmd -Ref b398714                 # 固定到某个 sha（可复现）
+.\install.cmd -DshDir D:\Git\deepseek-harness   # DSH 检出目录不在上层时显式指定
+.\install.cmd -Proxy http://127.0.0.1:20368     # 手动指定代理
+
+# 想直接调 PowerShell 也可以（参数同名）
+pwsh -File install.ps1 -Profile img -NoVerify
 ```
+
+外面那层 **`install.cmd` 不是多余的**：Windows 默认执行策略常是 `Restricted`，直接跑 `.ps1` 会被拒
+（`running scripts is disabled on this system`）；`.cmd` 外壳用 `-ExecutionPolicy Bypass` 调 PowerShell，
+于是入口就是一个**可双击的单文件**，参数也照样透传。
 
 脚本做四件事：① 找不到 DSH 目录时向上搜索（或用 `-DshDir` / 环境变量 `DSH_DIR`）；
 ② **自动套用 Windows 系统代理**（浏览器能上 GitHub 而 git 不能，就是因为 git 不读系统代理设置 ——
@@ -27,7 +34,7 @@ pwsh -File install.ps1 -Proxy http://127.0.0.1:20368     # 手动指定代理
 ④ 再跑一次 `--dump-config` 确认 profile 组合树里 `imagegen` 层在位。最后会提示你**重启 DSH**。
 
 > 脚本用 UTF-8 BOM 保存，所以在 Windows PowerShell 5.1 与 PowerShell 7 下中文都能正常显示；
-> 非 Windows 上会跳过注册表探测（用 `-Proxy` 指定即可）。
+> 非 Windows 上跳过注册表探测（用 `-Proxy` 指定即可），直接 `pwsh -File install.ps1`。
 
 ### 手动命令（脚本做的事，或不想用脚本时）
 

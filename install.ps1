@@ -119,8 +119,18 @@ $spec = "github:$Repo#$Ref"
 Write-Step "安装：pnpm dsh plugin --profile $Profile add $spec"
 Push-Location $DshDir
 try {
-    & $pnpm dsh plugin --profile $Profile add $spec
-    if ($LASTEXITCODE -ne 0) { Fail "pnpm 返回 $LASTEXITCODE（网络/凭据问题？试试 -Proxy <地址>，或核对仓库名与 -Ref）" }
+    # ⚠️ 原生命令（pnpm / node / git）把进度写到 stderr，而 PowerShell 5.1 在
+    # $ErrorActionPreference='Stop' 下会把那当成致命错误直接终止 —— 本脚本踩过这个坑。
+    # 所以调原生命令期间临时降级为 Continue，只认退出码。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $pnpm dsh plugin --profile $Profile add $spec
+        $installCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($installCode -ne 0) { Fail "pnpm 返回 $installCode（网络/凭据问题？试试 -Proxy <地址>，或核对仓库名与 -Ref）" }
 } finally {
     Pop-Location
 }
@@ -141,15 +151,22 @@ if (-not $NoVerify) {
     $node = (Get-Command node -ErrorAction SilentlyContinue).Source
     if ($node -and (Test-Path (Join-Path $pkgDir 'smoke.mjs'))) {
         Write-Step "离线自检（不联网、不花额度）"
-        & $node (Join-Path $pkgDir 'smoke.mjs') | Select-Object -Last 2
-        if ($LASTEXITCODE -ne 0) { Write-Warn2 "smoke 没全绿，上面的 FAIL 行说明了是哪里" } else { Write-Ok "smoke 全绿" }
+        $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try {
+            & $node (Join-Path $pkgDir 'smoke.mjs') 2>&1 | Select-Object -Last 2
+            $smokeCode = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $prevEap }
+        if ($smokeCode -ne 0) { Write-Warn2 "smoke 没全绿，上面的 FAIL 行说明了是哪里" } else { Write-Ok "smoke 全绿" }
     } else {
         Write-Warn2 "跳过 smoke（缺 node 或缺 smoke.mjs）"
     }
     Write-Step "组合树自检"
     Push-Location $DshDir
     try {
-        $dump = & $pnpm dsh --profile $Profile --dump-config 2>&1
+        $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try {
+            $dump = & $pnpm dsh --profile $Profile --dump-config 2>&1 | Out-String
+        } finally { $ErrorActionPreference = $prevEap }
         if ($dump -match 'imagegen') { Write-Ok "profile 组合树里 imagegen 层在位" }
         else { Write-Warn2 "dump-config 里没看到 imagegen —— 到 DSH 里确认 profile 的 bundles 列表" }
     } finally { Pop-Location }

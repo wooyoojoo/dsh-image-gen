@@ -1,6 +1,6 @@
 {
   "name": "dsh-imagegen",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "generate_image: OpenAI-compatible image generation and editing tool for DeepSeek Harness.",
   "type": "module",
@@ -18,7 +18,9 @@
     "client.js",
     "cordis.patch.yml",
     "README.md",
-    "smoke.mjs"
+    "smoke.mjs",
+    "install.ps1",
+    "install.cmd"
   ],
   "dsh": {
     "bundle": {

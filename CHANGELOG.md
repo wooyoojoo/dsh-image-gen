@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1 — 2026-09-27
+
+打包与文档发布，**插件代码（`index.js`）与 0.2.0 完全一致**。
+
+- 新增 **`install.ps1`**：一键安装/更新（幂等）。自动向上搜索 DSH 目录、**自动套用 Windows 系统代理**
+  （只对本次命令设 `HTTP(S)_PROXY`，不改全局 git 配置）、装完跑离线 smoke（31 项）+ `--dump-config` 复核，并提示重启 DSH。
+- 新增 **`install.cmd`**：`.cmd` 外壳。Windows 默认执行策略常是 `Restricted`，直接跑 `.ps1` 会被拒；
+  外壳用 `-ExecutionPolicy Bypass` 调 PowerShell，并在每次运行前**自动补回 `install.ps1` 缺失的 UTF-8 BOM**
+  （PowerShell 5.1 按 ANSI 读无 BOM 的 `.ps1`，中文串会乱到破坏语法 —— 这个坑已实测踩过）。
+- `files` 纳入两个安装器，tarball 自带走更新入口。
+- README 增加「一键安装 / 更新」章节。
+
 ## 0.2.0 — 2026-09-27
 
 首次进 git。相对 0.1.3 **只新增能力，未改既有行为**（`generations` 路径与旧参数完全兼容）。
