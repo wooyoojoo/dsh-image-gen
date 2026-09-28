@@ -362,7 +362,7 @@ pnpm dsh plugin --profile web add dsh-imagegen
 - 只支持 OpenAI 兼容的 `POST {base}/v1/images/generations` 与 `POST {base}/v1/images/edits`；Gemini 原生（nano banana）、以及各家私有形态仍需另加请求/响应分支。
 - **编辑的输入图只支持本地文件路径**（PNG/JPEG/WebP/GIF），不支持 DSH 附件 id；`mask` 一般要求与第一张图同尺寸同格式。
 - `background` / `seed` / `input_fidelity` / `extra` 是**盲透传**：插件不知道服务方认不认，报错原样带回来。
-- 结果以文件路径返回，看图要模型再调 `read_image`，而 `read_image` 要求当前路由模型声明图片输入。
+- 结果**同时**给出文件路径和 image 块：模型不用再调 `read_image` 就能看到刚画的图；只有路由不吃图片（收到 DSH 的占位符）时才需要 `read_image`，而它要求当前路由模型声明图片输入。
 - 用 Node `fs` 直接写盘，不走 `ctx.fs` 的沙箱策略；写入位置完全由 `outputDir`（配置、插件页覆盖或单次参数）决定。
 - **画廊没有真缩略图**：不引图像解码库，缩略图就是原图字节 + `loading="lazy"` + `private, max-age=31536000, immutable`。
   一页 24 张时只请求可见的那几张，但输出目录里全是几 MB 的大图、又一次性列几百张时会比较费流量。

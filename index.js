@@ -1317,9 +1317,9 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
   return {
     name: 'generate_image',
     description: 'Generate or edit one or more images with a third-party image model, and save them as files. '
+      + 'Each generated image is attached to this result, so you can see what was drawn without reading the file back; when an image does not reach you, read its saved path with read_image. '
       + 'Pass `image` (a local path, or several) to keep an existing picture and change only what the prompt asks for — that switches the call to the provider\'s edit endpoint. '
-      + '`mask`, `background`, `output_format`, `seed`, and `input_fidelity` are passed through when the provider understands them, and any other provider field goes into `extra`. '
-      + 'Use read_image on a saved path to look at the result before iterating.',
+      + '`mask`, `background`, `output_format`, `seed`, and `input_fidelity` are passed through when the provider understands them, and any other provider field goes into `extra`.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1327,7 +1327,11 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
         prompt: { type: 'string', description: 'The image to generate, or the change to make when image is given.' },
         model: { type: 'string', description: `Image model id. Defaults to ${DEFAULT_MODEL}.` },
         size: { type: 'string', description: `Image size such as 1024x1024. Defaults to ${DEFAULT_SIZE}.` },
-        quality: { type: 'string', description: 'Provider quality level, for example low, medium, high, or auto.' },
+        quality: {
+          type: 'string',
+          description: 'Provider quality level: low, medium, high, or auto where the provider offers them; omit to let the provider decide. '
+            + 'A value the provider does not support fails the call, and low visibly degrades fine detail.',
+        },
         n: { type: 'integer', description: `How many images to generate, 1 to ${MAX_IMAGES}. Defaults to 1.` },
         image: {
           type: 'array',
