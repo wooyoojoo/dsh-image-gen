@@ -661,16 +661,34 @@ async function attachImage(ctx, config, bytes, mediaType, path) {
 }
 
 /**
+ * Spell a saved path for model-facing text.
+ *
+ * A Windows path carries backslashes, and Markdown reads a backslash before
+ * punctuation as an escape: `C:\a\.b\c.png` reaches a renderer as
+ * `C:\a.b\c.png`, so a path copied out of this text addresses a file that does
+ * not exist — or, in a destination holding spaces, stops the image being parsed
+ * at all and shows the whole `![](...)` as text. Forward slashes address the
+ * same file on every platform, so the model-facing text uses them while the
+ * structured value keeps the native spelling for host-side work.
+ *
+ * @param path - a saved file path as the host wrote it.
+ * @returns The same path with forward slashes.
+ */
+export function markdownPath(path) {
+  return path.replaceAll('\\', '/')
+}
+
+/**
  * Render the canonical result as the model-facing summary text.
  *
  * @param value - the canonical result value.
- * @returns One line per saved file.
+ * @returns One line per saved file, each path spelled for copying into a message.
  */
 export function renderResult(value) {
   const via = value.mode === KIND_EDITS ? ` (edited from ${value.inputImages ?? 'the input image(s)'})` : ''
   const lines = [`Generated ${value.images.length} image(s) with ${value.model}${via}:`]
   for (const image of value.images) {
-    lines.push(`- ${image.path} (${image.mimeType}, ${image.bytes} bytes)`)
+    lines.push(`- ${markdownPath(image.path)} (${image.mimeType}, ${image.bytes} bytes)`)
   }
   if (value.revisedPrompt !== undefined) lines.push(`Revised prompt: ${value.revisedPrompt}`)
   lines.push('Read a saved file with the read_image tool to inspect or iterate on the result.')

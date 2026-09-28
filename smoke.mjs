@@ -44,6 +44,7 @@ import {
   readOverrides,
   recordGeneratedImages,
   redactCredentials,
+  renderResult,
   requestKind,
   resolveConfig,
   resolveEndpoint,
@@ -357,6 +358,16 @@ check('the system open command is argv, never a shell, and matches the platform'
   assert.deepEqual(systemOpenCommand('darwin', '/a/b.png', 'reveal'), { command: 'open', args: ['-R', '/a/b.png'] })
   assert.deepEqual(systemOpenCommand('linux', '/a/b.png', 'reveal'), { command: 'xdg-open', args: ['/a'] })
   assert.equal(systemOpenCommand('aix', '/a/b.png', 'open'), undefined)
+})
+check('result text spells saved paths with forward slashes, for copying into a message', () => {
+  const text = renderResult({
+    model: 'stub-model',
+    mode: 'generations',
+    images: [{ path: 'C:\\Users\\me\\.dsh\\out\\image-1.png', mimeType: 'image/png', bytes: 3 }],
+  })
+  assert.equal(text.includes('- C:/Users/me/.dsh/out/image-1.png (image/png, 3 bytes)'), true)
+  // A backslash before punctuation is a Markdown escape, so none may survive.
+  assert.equal(text.includes('\\'), false)
 })
 
 /** A credential provider with the seam's shape: resolve, describe, set, unset. */

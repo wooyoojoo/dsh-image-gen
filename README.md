@@ -269,6 +269,11 @@ IMAGE_API_KEY=sk-...
 - **可持久化、可重放** —— 图片提交进 DSH 的附件存储（内容寻址，`~/.dsh/attachments/v1/`），会话日志里存的是引用，重启与回放都在。
 - **Web 端能拿到字节** —— 客户端按引用向会话请求图片，服务端会校验该附件确实被这个会话引用过。
 
+文本里的路径按**正斜杠**拼（`D:/dir/image.png`）。Windows 原生反斜杠在 Markdown 里是转义序列：`\.` 会被还原成 `.`，
+模型把原生路径粘进正文时，轻则指向一个不存在的文件（`/api/file` 404，界面显示"图片无法预览"），
+重则整段 `![](...)` 压根不被解析、原样显示成文字。正斜杠在所有平台上指向同一个文件，`read_image` 与 `image`
+参数也都认，所以**模型可见的文本统一用它**；结构化结果里的 `path` 保持原生拼写，供宿主侧打开 / 定位使用。
+
 但**光有 image block 还不够**：内置的图片卡片把工具名写死了（`if (call?.name !== 'read_image') return null`），别的工具返回 image block 会落到通用卡片上，被 `JSON.stringify` 成原始 JSON。所以这个包还带一个**客户端半边** `client.js`，认领 `tool.call.toolview` 里 `generate_image` 这个键：
 
 ```js
