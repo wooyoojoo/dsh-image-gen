@@ -556,7 +556,7 @@ async function appendEditParts(form, request) {
  * @param request - validated request fields.
  * @param timeoutMs - configured per-call budget.
  * @param signal - caller cancellation, combined with the budget.
- * @returns The image entries and the response's revised prompt when present.
+ * @returns The image entries, the response's revised prompt, and its usage counters.
  * @throws On transport failure, a non-2xx status, or an unreadable body.
  */
 async function requestImages(endpoint, apiKey, request, timeoutMs, signal) {
@@ -595,7 +595,47 @@ async function requestImages(endpoint, apiKey, request, timeoutMs, signal) {
   const revised = payload !== null && typeof payload === 'object' && isFilledString(payload.revised_prompt)
     ? payload.revised_prompt
     : undefined
-  return { entries: readImageEntries(payload), revisedPrompt: revised }
+  return { entries: readImageEntries(payload), revisedPrompt: revised, usage: readUsage(payload) }
+}
+
+/** Usage counters this plugin reports; any other field in the block is ignored. */
+const USAGE_COUNTERS = ['input_tokens', 'output_tokens', 'total_tokens']
+
+/** Per-modality input counters reported beside the totals. */
+const INPUT_TOKEN_DETAIL_COUNTERS = ['image_tokens', 'text_tokens']
+
+/** Whether `value` is a token count this plugin reports: a non-negative integer. */
+function isCounter(value) {
+  return Number.isInteger(value) && value >= 0
+}
+
+/**
+ * Read the response's `usage` block, keeping only the counters this plugin reports.
+ *
+ * A provider that omits `usage`, or answers with another shape, yields
+ * `undefined`: the call still succeeds and no record invents a cost. Counters
+ * arrive unvalidated over the wire, so anything that is not a non-negative
+ * integer is dropped rather than stored.
+ *
+ * @param payload - the parsed response body.
+ * @returns The counters worth keeping, or undefined when the response carries none.
+ */
+export function readUsage(payload) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.usage)) return undefined
+  const usage = payload.usage
+  const kept = {}
+  for (const field of USAGE_COUNTERS) {
+    if (isCounter(usage[field])) kept[field] = usage[field]
+  }
+  const details = isPlainObject(usage.input_tokens_details) ? usage.input_tokens_details : undefined
+  if (details !== undefined) {
+    const input = {}
+    for (const field of INPUT_TOKEN_DETAIL_COUNTERS) {
+      if (isCounter(details[field])) input[field] = details[field]
+    }
+    if (Object.keys(input).length > 0) kept.input_tokens_details = input
+  }
+  return Object.keys(kept).length > 0 ? kept : undefined
 }
 
 /**
@@ -1433,7 +1473,7 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
       const request = parseArgs(args, effective)
       const kind = requestKind(request)
       const { endpoint, apiKey } = await resolveTarget(ctx, effective, kind)
-      const { entries, revisedPrompt } = await requestImages(endpoint, apiKey, request, effective.timeoutMs, exec.signal)
+      const { entries, revisedPrompt, usage } = await requestImages(endpoint, apiKey, request, effective.timeoutMs, exec.signal)
       const outputDir = resolveOutputDir(request.outputDir, effective.outputDir)
       await mkdir(outputDir, { recursive: true })
       const stem = outputStem()
@@ -1472,6 +1512,9 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
         ...image.width === undefined ? {} : { width: image.width },
         ...image.height === undefined ? {} : { height: image.height },
         ...request.quality === undefined ? {} : { quality: request.quality },
+        // The response's own counters. One call's usage, repeated on every record
+        // that call produced: the index has no per-call entity.
+        ...usage === undefined ? {} : { usage },
         ...request.images.length === 0 ? {} : { inputImages: request.images },
       }))).catch((error) => { warn(ctx, error) })
       return result

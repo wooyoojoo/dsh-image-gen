@@ -712,7 +712,8 @@ window.__ModuleLoader__.load({
     /** One gallery tile: the image, its prompt, and the actions on it. */
     function GalleryTile({ record, t, onOpen, onHandOff, onCopy, onReuse, onRemove, confirming, onConfirming }) {
       const bytes = formatBytes(record.bytes)
-      const meta = [record.mode, record.size, bytes, formatTime(record.createdAt)].filter(Boolean).join(' · ')
+      const tokens = record.usage?.output_tokens
+      const meta = [record.mode, record.size, bytes, tokens === undefined ? undefined : `${tokens.toLocaleString()} tok`, formatTime(record.createdAt)].filter(Boolean).join(' · ')
       const action = (label, onClick) => h(Button, { variant: 'ghost', size: 'sm', onClick }, label)
       return h('div', { style: S.tile },
         h('button', {

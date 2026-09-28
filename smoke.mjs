@@ -42,6 +42,7 @@ import {
   probeConnection,
   readImageIndex,
   readOverrides,
+  readUsage,
   recordGeneratedImages,
   redactCredentials,
   renderResult,
@@ -231,7 +232,10 @@ const server = createServer((req, res) => {
   req.on('end', () => {
     seen.push({ url: req.url, contentType: req.headers['content-type'] ?? '', raw: Buffer.concat(chunks) })
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] }))
+    res.end(JSON.stringify({
+      data: [{ b64_json: PNG.toString('base64') }],
+      usage: { input_tokens: 11, output_tokens: 1756, total_tokens: 1767, input_tokens_details: { image_tokens: 0, text_tokens: 11 } },
+    }))
   })
 })
 await new Promise(ready => server.listen(0, '127.0.0.1', ready))
@@ -297,6 +301,9 @@ try {
     assert.equal(newest.model, 'stub-model')
     assert.equal(newest.bytes, PNG.byteLength)
     assert.equal(newest.mimeType, 'image/png')
+    assert.deepEqual(newest.usage, {
+      input_tokens: 11, output_tokens: 1756, total_tokens: 1767, input_tokens_details: { image_tokens: 0, text_tokens: 11 },
+    })
     assert.equal(newest.name.endsWith('.png'), true)
     assert.deepEqual(newest.inputImages, [inputImage])
     assert.equal(index[1].mode, 'generations')
@@ -368,6 +375,19 @@ check('result text spells saved paths with forward slashes, for copying into a m
   assert.equal(text.includes('- C:/Users/me/.dsh/out/image-1.png (image/png, 3 bytes)'), true)
   // A backslash before punctuation is a Markdown escape, so none may survive.
   assert.equal(text.includes('\\'), false)
+})
+check('response usage keeps the counters and drops everything else', () => {
+  assert.deepEqual(
+    readUsage({ usage: { input_tokens: 11, output_tokens: 1756, total_tokens: 1767, junk: 'x', input_tokens_details: { image_tokens: 0, text_tokens: 11, other: 1 } } }),
+    { input_tokens: 11, output_tokens: 1756, total_tokens: 1767, input_tokens_details: { image_tokens: 0, text_tokens: 11 } },
+  )
+  // A provider that omits usage, or answers with another shape, records nothing.
+  assert.equal(readUsage({ data: [] }), undefined)
+  assert.equal(readUsage({ usage: 'nope' }), undefined)
+  assert.equal(readUsage({ usage: {} }), undefined)
+  assert.equal(readUsage({ usage: { output_tokens: -1 } }), undefined)
+  assert.equal(readUsage({ usage: { output_tokens: 1756.5 } }), undefined)
+  assert.equal(readUsage(null), undefined)
 })
 
 /** A credential provider with the seam's shape: resolve, describe, set, unset. */

@@ -137,7 +137,7 @@ IMAGE_API_KEY=sk-...
 
 **② 已生成图片画廊**（`plugins.detail.section`，同一页往下滚）
 
-每次生成都会往 `$DSH_HOME/imagegen/images.json` 追加一条记录（prompt、模型、尺寸、质量、模式、输入图、字节、宽高、附件 id），画廊按它倒序列出，每张图可以：
+每次生成都会往 `$DSH_HOME/imagegen/images.json` 追加一条记录（prompt、模型、尺寸、质量、模式、输入图、字节、宽高、附件 id，以及响应里的 `usage`），画廊按它倒序列出，每张图可以：
 
 - **点击放大** —— 灯箱预览（复用仓库 UI 原语那套缩略图尺寸规则）
 - **打开** —— 交给系统默认应用
@@ -147,6 +147,8 @@ IMAGE_API_KEY=sk-...
 - **删除** —— 两步确认，删文件 + 删索引记录，不可撤销
 
 图片按 **id** 取（`GET /api/imagegen/image?id=…`），只服务索引里登记过的记录；索引最多保留最新 500 条，更早的文件留在磁盘上但不再列出。
+
+记录里的 `usage` 直接来自响应体，只保留 `input_tokens` / `output_tokens` / `total_tokens` 与 `input_tokens_details` 这几个数值字段（服务方不回 `usage` 时这条记录就没有这个字段）。它记的是**那次调用**的用量：`n > 1` 时同一份会出现在该次调用的每条记录上，因为索引是按图存的、没有「调用」这一层。要比较档位成本，就用同一个 prompt 换 `quality` / `size` 各跑一次，对着这里的 `output_tokens` 看（画廊每张图的元信息里也会显示它）。
 
 > 这一页的所有请求都走 `/api/imagegen/*`，位于连接层的认证围栏之下 —— 未认证请求拿到 401。
 > `connection` 是**可选**依赖（挂在子 fiber 上），所以在没有 Web 组合的 headless profile 里，工具照常注册，只是没有这些路由。
@@ -274,10 +276,10 @@ cd <本包目录>
 node smoke.mjs          # 或 pnpm test
 ```
 
-覆盖（**69 项**）：
+覆盖（**70 项**）：
 
-- **纯函数**：端点解析（含 generations ↔ edits 推导）、参数校验（`image`/`mask`/`background`+`jpeg` 冲突/`extra` 合并/未知参数拒绝）、两种请求体构造、模型可见文本里的路径拼法。
-- **对本地 stub 服务真跑一遍 `execute`**：JSON 与 multipart 两条路 + 落盘字节比对 + 读不到文件/非图片的报错 + 索引记录内容。
+- **纯函数**：端点解析（含 generations ↔ edits 推导）、参数校验（`image`/`mask`/`background`+`jpeg` 冲突/`extra` 合并/未知参数拒绝）、两种请求体构造、模型可见文本里的路径拼法、响应用量字段的读取与清洗。
+- **对本地 stub 服务真跑一遍 `execute`**：JSON 与 multipart 两条路 + 落盘字节比对 + 读不到文件/非图片的报错 + 索引记录内容（含 `usage`）。
 - **插件页那一面**：状态目录与覆盖文件的读写与清洗、凭据的写/清除/被启动环境遮挡或被 profile 固定时的拒绝、图片索引、**全部 8 条路由**（含「按 id 而非路径取图」和「open/reveal 对未知 id 不启动任何进程」）、连通性探测的三种结果。
 - **客户端半边**：把 `client.js` 放进 `node:vm`、按模块加载器的方式执行，用桩 React 驱动 `apply`，校验三处注册的名称/key/id 与译文字典，并渲染每个界面的首屏状态 —— 这同时证明**拿不到 `ui-primitives` 时会退回原生元素而不是加载失败**。
 
