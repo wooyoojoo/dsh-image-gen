@@ -161,9 +161,9 @@ IMAGE_API_KEY=sk-...
 | `baseUrlEnv` | `IMAGE_BASE_URL` | 承载 API 基址的凭据名 |
 | `apiKeyEnv` | `IMAGE_API_KEY` | 承载 key 的凭据名 |
 | `apiKey` | 无 | 明文 key，仅调试；优先用 `apiKeyEnv` |
-| `model` | `gpt-image-2.5-flare` | 生图模型 id |
+| `model` | `gpt-image-2.5-flare` | 生图模型 id。同代两个变体：`flare`（日常默认，快）／`sunburst`（精度优先，慢）；**两者同价**，对照见「实测矩阵」 |
 | `size` | `1024x1024` | 传给接口的 `size` |
-| `quality` | 不传 | 质量档。**本机中继只认 `low`/`medium`/`high`/`auto`（最高 `high`）** —— 传其它值会得到 `Invalid value: … Supported values are: …` 的 400。不传则由服务方决定（等于 `auto`） |
+| `quality` | 不传 | 质量档：`low` / `medium` / `high` / `xhigh` / `max` / `auto`（本机中继已实测通过前五档）。**它直接决定费用** —— 档位选择计费的输出图像 token 预算，`max` 是 `low` 的约 36 倍，见「实测矩阵」。不传则由服务方决定（等于 `auto`） |
 | `background` | 不传 | 透传字段的**默认值**（如 `transparent`）。单次调用的 `background` 覆盖它 |
 | `outputFormat` | 不传 | 透传字段的默认值（`png`/`jpeg`/`webp`），落成请求里的 `output_format` |
 | `timeoutMs` | `300000` | 单次调用预算。生图常见 30–120 秒，别调太小 |
@@ -222,15 +222,43 @@ IMAGE_API_KEY=sk-...
 
 **服务方差异**：`background` / `seed` / `input_fidelity` / `extra` 是**原样透传** —— 插件不判断服务方是否支持。若中转返回 4xx 且报文提到某个字段，那就是那一层不支持，去掉即可。
 
-### 本机中继（`cf.api.fan` + `gpt-image-2.5-flare`）实测能力矩阵（2026-09）
+### 本机中继（`cf.api.fan` + `gpt-image-2.5`）实测矩阵（2026-09）
 
-真打了 7 次调用量出来的，不是照文档推的。换中继或换模型请重测：
+真打了十几次调用量出来的，不是照文档推的。换中继或换模型请重测。
+
+**质量档就是账单**（1024×1024，数字读自响应里的 `usage.output_tokens`）：
+
+| `quality` | output tokens | 官价/张 | 相对 `low` | 实测 |
+|---|---|---|---|---|
+| `low` | 196 | $0.0059 | 1× | ✅ |
+| `medium` | 439（官方） | $0.0132 | 2.2× | 未测 |
+| `high` | 1,756 | $0.0527 | 9.0× | ✅ |
+| `xhigh` | 3,122 | $0.0937 | 15.9× | ✅ |
+| `max` | 7,024 | $0.2107 | **35.8×** | ✅ |
+
+- 中继**忠实透传**档位：实测 token 数与 OpenAI 计算器逐 token 吻合，不是"收下就忽略"。
+- `input_tokens` 只有 **91**（prompt 文字，约 $0.0005）—— **费用几乎全在输出图像 token**。
+- 2.5 的质量梯子相对 `gpt-image-2` **重新贴过标签**：`high` ≈ 旧 `medium` 的预算、`max` ≈ 旧 `high`。想要"以前 high 的效果"得用 `max`。
+- 档位也影响耗时：同批并发发起时，`max` 比 `high` 多约 27 秒（flare）到 67 秒（sunburst）。
+- `low` 的观感：本轮贴纸题材实测（n=1）**看不出明显劣化**；早先"切割发毛、渐变起噪"的结论待用细节密集的 prompt 复核。
+
+**flare vs sunburst**（同 prompt、同尺寸、同档位各一张）：
+
+| | `flare` | `sunburst` |
+|---|---|---|
+| token / 价格 | 196 / 1,756 / 3,122 / 7,024 | **完全相同** |
+| 耗时 | 快 | 慢（`max` 比 `high` 多约 67 秒） |
+| `low` / `high` 观感 | 扁平贴纸风，够用 | 与 flare 同档**看不出差别** |
+| `xhigh` / `max` | 细节与质感有提升 | `max` **明显换层**：半写实插画、完整场景、元素丰富 |
+
+结论：**sunburst 的代价是时间，不是钱**，而且它的优势只在 `xhigh`/`max` 显出来 —— 配 `high` 用 sunburst 等于白等。批量出贴纸用 `flare + low`（约 $0.006/张），单张精品再上 `sunburst + max`。
+
+**其余能力**：
 
 | 能力 | 结果 |
 |---|---|
 | `background: "transparent"` | ✅ 真透明底（`alpha min=0`、四角全 0、不透明约 9%） |
 | `n` 1–4 / `outputDir` / `output_format`（png、webp）/ 非方形 `size` | ✅ 全部生效 |
-| `quality` | ✅ 生效，但**枚举只有 `low`/`medium`/`high`/`auto`（最高 `high`）**，且 `low` 降质明显（切割发毛、渐变起噪），只适合试形状 |
 | `image` → `/images/edits`（multipart 上传） | ✅ 可用；输入图的透明底会保留 |
 | `mask` | ⚠️ 能传上去，**但模型不听**：带/不带 mask 两次编辑的轮廓 IoU 是 0.888 vs 0.893 |
 | `extra` / `providerOptions` | ✅ 确实到达线上（`extra:{seed:1}` 与具名 `seed` 报同一条错） |

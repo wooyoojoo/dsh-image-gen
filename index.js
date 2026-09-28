@@ -1387,8 +1387,8 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
         size: { type: 'string', description: `Image size such as 1024x1024. Defaults to ${DEFAULT_SIZE}.` },
         quality: {
           type: 'string',
-          description: 'Provider quality level: low, medium, high, or auto where the provider offers them; omit to let the provider decide. '
-            + 'A value the provider does not support fails the call, and low visibly degrades fine detail.',
+          description: 'Provider quality level: low, medium, high, xhigh, max, or auto where the provider offers them; omit to let the provider decide. '
+            + 'A higher level costs proportionally more because it selects the provider\'s image-token budget, and a value the provider does not support fails the call.',
         },
         n: { type: 'integer', description: `How many images to generate, 1 to ${MAX_IMAGES}. Defaults to 1.` },
         image: {
