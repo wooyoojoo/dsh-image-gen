@@ -47,24 +47,145 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     /**
-     * Shared atoms from the shell's platform module table. They are requested
-     * defensively: a harness that does not seed them must still render the tool
-     * card, so each control falls back to the plain element it wraps.
+     * The bundle's own controls and the styles they need.
+     *
+     * The host ships these atoms in `@deepseek-ai/dsh-client-ui-primitives`, and
+     * this bundle used to require that package. It does not any more: a plugin
+     * authored outside the harness has no type check and no release coupling
+     * with it, so a changed prop contract would not fail here — it would throw
+     * while rendering, blank this whole slot entry, and take the failures the
+     * tool card exists to show down with it. The declarations below are copied
+     * from the atoms (`src/Button.tsx`, `src/Input.tsx`, and their CSS modules),
+     * prefix-renamed, and reduced to the variants and sizes this bundle uses;
+     * every colour stays a `--dsw-*` token, so both themes still match the host.
+     * Only `react` and `react-dom` are requested from the module table now.
      */
-    let atoms = {}
-    try {
-      atoms = require('@deepseek-ai/dsh-client-ui-primitives')
-    } catch (error) {
-      // This shell does not share the primitives package; the fallbacks below
-      // keep the card and the settings page usable, only plainer.
-      atoms = {}
+    const CSS = `
+.imagegen-btn {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: none;
+  cursor: pointer;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--dsw-radius-sm);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  background: transparent;
+}
+.imagegen-btn:disabled { cursor: not-allowed; opacity: 0.4; }
+.imagegen-btn--primary {
+  background: var(--dsw-alias-button-primary-fill);
+  color: var(--dsw-alias-label-primary-foreground);
+}
+.imagegen-btn--primary:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover); }
+.imagegen-btn--ghost:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+.imagegen-btn--ghost:active:not(:disabled) { background: var(--dsw-alias-interactive-bg-active); }
+.imagegen-btn--outline {
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  background: transparent;
+}
+.imagegen-btn--outline:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+.imagegen-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 8px;
+  border: 0.5px solid var(--dsw-alias-border-l4);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-1);
+}
+.imagegen-field:focus-within { border-color: var(--dsw-alias-state-business-primary); }
+.imagegen-field-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--dsw-alias-label-primary);
+}
+.imagegen-field-input::placeholder { color: var(--dsw-alias-label-dimmed); }
+.imagegen-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: grid;
+  place-items: center;
+  padding: 40px;
+}
+.imagegen-lightbox-mask {
+  position: absolute;
+  inset: 0;
+  background: var(--dsw-alias-bg-mask-1);
+  backdrop-filter: var(--dsw-mask-blur);
+}
+.imagegen-lightbox-image {
+  position: relative;
+  max-width: min(100%, 1600px);
+  max-height: calc(100vh - 80px);
+  object-fit: contain;
+  border: 0;
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-specific-input-major);
+  box-shadow: var(--dsw-elevation-prominent);
+}
+.imagegen-lightbox-close {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 0.5px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 999px;
+  corner-shape: round;
+  background: var(--dsw-specific-input-major);
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+}
+.imagegen-lightbox-close:focus-visible {
+  outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 3px;
+}
+`
+
+    /**
+     * Mount the bundle's styles with the surface that uses them, so unmounting
+     * the surface removes them; the shell shares no stylesheet with a plugin.
+     */
+    function Styles() {
+      return h('style', null, CSS)
     }
-    const FallbackButton = ({ variant, size, icon, children, ...rest }) => h('button', { type: 'button', ...rest }, children)
-    const FallbackInput = ({ icon, className, ...rest }) => h('input', { className, ...rest })
-    const FallbackTag = ({ tone, className, children }) => h('span', { className }, children)
-    const Button = atoms.Button ?? FallbackButton
-    const Input = atoms.Input ?? FallbackInput
-    const Tag = atoms.Tag ?? FallbackTag
+
+    /**
+     * The host's action button: same geometry, variants, and disabled styling.
+     * Native button attributes pass through; `variant` and `size` stay here
+     * instead of reaching the DOM as attributes.
+     */
+    function Button({ variant = 'ghost', size = 'sm', children, ...rest }) {
+      return h('button', {
+        type: 'button',
+        className: `imagegen-btn imagegen-btn--${variant} imagegen-btn--${size}`,
+        ...rest,
+      }, children)
+    }
+
+    /** The host's single-line field: same frame, focus ring, and placeholder. */
+    function Input({ className, ...rest }) {
+      return h('span', { className: className === undefined ? 'imagegen-field' : `imagegen-field ${className}` },
+        h('input', { className: 'imagegen-field-input', ...rest }))
+    }
 
     /** Package name this bundle is installed as; it keys the Plugins-page slots. */
     const BUNDLE = 'dsh-imagegen'
@@ -348,64 +469,53 @@ window.__ModuleLoader__.load({
 
     /**
      * Document-level preview opened by clicking a thumbnail. Closes on Escape,
-     * backdrop press, or the close control. Rendered through a body portal: an
-     * opener inside a transformed or filtered ancestor would otherwise trap the
-     * fixed backdrop in that ancestor's box instead of covering the viewport.
+     * backdrop press, or the close control, and holds the keyboard while it is
+     * open: the close control takes focus, Tab stays inside the dialog, and
+     * unmounting returns focus to the control that opened it. Rendered through a
+     * body portal: an opener inside a transformed or filtered ancestor would
+     * otherwise trap the fixed backdrop in that ancestor's box instead of
+     * covering the viewport. Everything the dialog owns sits inside the element
+     * that carries `role="dialog"`, so the role contains the image and the
+     * control rather than an empty box beside them.
      */
     function ImageLightbox({ src, alt, labels, onClose }) {
+      const closeRef = React.useRef(null)
+      const restoreRef = React.useRef(null)
       React.useEffect(() => {
-        const onKeyDown = (event) => { if (event.key === 'Escape') onClose() }
-        window.addEventListener('keydown', onKeyDown)
-        return () => { window.removeEventListener('keydown', onKeyDown) }
+        restoreRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+        if (closeRef.current !== null) closeRef.current.focus()
+        const onKeyDown = (event) => {
+          if (event.key === 'Escape') {
+            event.stopPropagation()
+            onClose()
+          }
+          // One control, so Tab parks on it instead of walking the page behind.
+          if (event.key === 'Tab') {
+            event.preventDefault()
+            if (closeRef.current !== null) closeRef.current.focus()
+          }
+        }
+        window.addEventListener('keydown', onKeyDown, true)
+        return () => {
+          window.removeEventListener('keydown', onKeyDown, true)
+          if (restoreRef.current !== null) restoreRef.current.focus()
+        }
       }, [onClose])
       return createPortal(
         h('div', {
           role: 'dialog',
           'aria-modal': 'true',
           'aria-label': labels.dialog,
-          style: {
-            position: 'fixed',
-            inset: 0,
-            zIndex: 1200,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-          },
+          className: 'imagegen-lightbox',
         },
-        h('div', {
-          'aria-hidden': 'true',
-          onMouseDown: onClose,
-          style: { position: 'absolute', inset: 0, background: 'rgba(0, 0, 0, 0.72)' },
-        }),
-        h('img', {
-          src,
-          alt,
-          style: {
-            position: 'relative',
-            maxWidth: '92vw',
-            maxHeight: '92vh',
-            borderRadius: '10px',
-            boxShadow: '0 12px 48px rgba(0, 0, 0, 0.45)',
-          },
-        }),
+        h('div', { className: 'imagegen-lightbox-mask', 'aria-hidden': 'true', onMouseDown: onClose }),
+        h('img', { className: 'imagegen-lightbox-image', src, alt }),
         h('button', {
+          ref: closeRef,
           type: 'button',
+          className: 'imagegen-lightbox-close',
           onClick: onClose,
           'aria-label': labels.close,
-          style: {
-            position: 'absolute',
-            top: '16px',
-            right: '16px',
-            width: '32px',
-            height: '32px',
-            borderRadius: '50%',
-            border: 'none',
-            cursor: 'pointer',
-            fontSize: '16px',
-            lineHeight: '1',
-            color: '#fff',
-            background: 'rgba(255, 255, 255, 0.18)',
-          },
         }, '✕')),
         document.body,
       )
@@ -647,6 +757,7 @@ window.__ModuleLoader__.load({
       }
 
       return h('div', { style: S.stack },
+        h(Styles),
         h(NoticeLine, { notice }),
         h(Field, {
           label: t('config.baseUrl'),
@@ -819,6 +930,7 @@ window.__ModuleLoader__.load({
       const closePreview = React.useCallback(() => { setPreview(null) }, [])
 
       return h('section', { style: S.section },
+        h(Styles),
         h('h3', { style: S.heading }, t('gallery.title')),
         h(NoticeLine, { notice }),
         problem === null ? null : h('div', { style: S.problem }, t('gallery.loadFailed', { detail: problem })),

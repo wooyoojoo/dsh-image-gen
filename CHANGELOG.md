@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 — 2026-09-29
+
+**按 DSH 创造模式的插件规范收口**：去掉对 Harness 客户端包 `@deepseek-ai/dsh-client-ui-primitives` 的运行时 import，补齐灯箱缺掉的那一半行为，并让插件页的每个操作都能从对话里调用。
+
+### 变更
+
+- **客户端半边不再 import 任何 `@deepseek-ai/dsh-*` 包。** `Button` 与 `Input` 改成本包自带的控件：逐条照抄宿主 `ui-primitives` 的 `Button.tsx` / `Input.tsx` 与它们的 CSS module，类名加 `imagegen-` 前缀，颜色只引用 `--dsw-*` 令牌，样式元素随用到它的界面一起挂载（因此也随卸载消失）。原先「拿不到就退回原生元素」的防御一并删除 —— 它护得住「包不在」，护不住「包在但 prop 契约变了」，而后者会在渲染时抛异常、把这个槽位条目整个清空，连工具调用的失败状态一起消失。顺带删掉从未使用的 `Tag` 别名，并让 `variant` / `size` 不再被摊成 DOM 属性。
+- **灯箱补齐宿主的行为**：打开时聚焦关闭按钮，Tab 圈在对话框内，关闭时把焦点还给打开它的控件；`role="dialog"` 现在**包住**图片与关闭按钮（此前它是个空盒子，两者是它的兄弟节点，`aria-modal` 因此名不副实）；Escape 改为捕获阶段监听并 `stopPropagation`。字面色值（`rgba(0,0,0,.72)`、`#fff` 等）换成 `--dsw-alias-bg-mask-1`、`--dsw-specific-input-major`、`--dsw-elevation-prominent`、`--dsw-focus-ring-*` 等令牌，明暗两套都由主题决定。
+- **新增 `image_library` 工具**，把插件页的操作开放给 agent：`list` / `status` / `test` / `configure` / `delete` / `open` / `reveal`。页面与工具走同一组函数（新抽出的 operations 层：`listImages`、`deleteImage`、`handOffImage`、`testConnection`，加上原有的 `applyUpdate`、`buildStatus`），不存在两份实现；`opened`/`revealed` 这类只由页面完成的动作不需要工具。`configure` **拒绝**写 `baseUrl` 与 `apiKey`：端点与密钥只由用户写入。
+- `apply` 现在注册两个工具；`generate_image` 自身的行为、参数与结果都没有变。
+
+### 校验
+
+- `node smoke.mjs` → **79/79**（新增 8 项：`image_library` 的 list / status / configure / 拒绝凭据 / 参数校验 / 按 id 删除 / 并发声明，以及「浏览器半边只向模块表请求 `react` 与 `react-dom`」——后者是硬约束，多要一个 specifier 就会让加载失败）
+- `node --check` 对 `index.js`、`client.js`、`smoke.mjs` 全部通过
+
+### 已知缺口
+
+- 灯箱的焦点与 Tab 行为仍**没有自动化覆盖**（本机没有浏览器自动化）：VM 只验证了模块能加载、三处注册正确、每个界面首屏能渲染。这部分需要在真实 GUI 里过一眼。
+- 样式仍以行内样式为主，只有控件与灯箱走了自带的类名；没有构建步骤就没有 CSS Modules。
+
 ## 0.3.0 — 2026-09-27
 
 **插件页管理**：请求地址、API KEY 和已生成的图片都能在 DSH 侧边栏「插件」页里看和改，

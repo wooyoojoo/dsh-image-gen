@@ -1,8 +1,8 @@
 # dsh-imagegen
 
-一个独立于 DSH 仓库的 Harness 插件（bundle）：注册 `generate_image` 工具，用第三方 key 调用 OpenAI 兼容的生图接口，把图片落盘到工作区。
+一个独立于 DSH 仓库的 Harness 插件（bundle）：注册 `generate_image` 工具，用第三方 key 调用 OpenAI 兼容的生图接口，把图片落盘到工作区；再注册 `image_library` 工具，把插件页的画廊与设置一并交给 agent（见「image_library」一节）。
 
-它 **只 import `node:` 内置模块**，不 import 任何 `@deepseek-ai/dsh-*` 包，也没有构建步骤 —— 源码即产物，所以 git / tarball / 目录链接三种装法跑的是同一份文件。取舍理由见文末「设计取舍」。
+宿主半边**只 import `node:` 内置模块**，不 import 任何 `@deepseek-ai/dsh-*` 包，也没有构建步骤 —— 源码即产物，所以 git / tarball / 目录链接三种装法跑的是同一份文件。浏览器半边同理：只向模块表要 `react` 与 `react-dom`，控件是本包自带的副本而不是宿主包的运行时依赖。取舍理由见文末「设计取舍」。
 
 ## 装一次，之后什么都不用加
 
@@ -267,6 +267,23 @@ IMAGE_API_KEY=sk-...
 
 两条实践含义：**① 没有复现** —— `seed` 不可用，要比较就同一次多出几张；**② 编辑不是"局部重绘"** —— 实测相似度约 IoU 0.89，是"同一主体重画一遍"，`input_fidelity` 与 `mask` 都救不了。要"只改一处、其余逐像素不变"，请用确定性的程序化处理（裁剪 / 改色 / 形态学加粗），而不是让模型改图。
 
+## image_library：画廊与设置，也能从对话里用
+
+插件页上能做的事，agent 通过第二个工具 `image_library` 做同一批操作 —— 两边调用 `index.js` 里同一组函数（`listImages`、`deleteImage`、`handOffImage`、`testConnection`、`applyUpdate`、`buildStatus`），所以不会出现「页面能删、工具删不掉」这种分叉。
+
+| `action` | 作用 | 需要 |
+|---|---|---|
+| `list` | 按时间倒序列出索引里的图片：id、路径、prompt、尺寸、字节 | 可选 `limit`（1–100，默认 20）、`offset` |
+| `status` | 报告地址与凭据的来源、五个可覆盖字段各自来自哪一层、生效值、状态目录 | — |
+| `test` | 问中继 `GET {base}/v1/models`，证明地址与 KEY 都通 | — |
+| `configure` | 改一个设置（`model` / `size` / `quality` / `timeoutMs` / `outputDir`）；`value: null` 表示清掉覆盖、恢复下层值 | `field`、`value` |
+| `delete` | 删掉一张图和它的索引记录 | `id` |
+| `open` / `reveal` | 交给系统默认应用打开 / 在文件管理器中定位 | `id` |
+
+`list`、`status`、`test` 不改任何状态，因此声明为可与其他工具调用并发执行。
+
+**`configure` 拒绝写 `baseUrl` 和 `apiKey`**：这两个值只由用户在插件页或凭据面写入。理由是它们决定每一次生成把请求和图片发到哪里 —— 能改它们的调用方，就能把后续所有生成重定向到自己的中转。
+
 ## 会话里显示图片
 
 工具结果含两样东西：一段文本（路径清单），外加每张图一个 `{ type: 'image', attachment }` 块。这个块解决三件事：
@@ -293,7 +310,7 @@ ctx.slots.inject('tool.call.toolview', () => ctx.slots.register(
 
 `client.js` 一共认领三个键：上面这个工具卡片，加上插件页的 `plugins.bundle.config`（key = `dsh-imagegen`）与 `plugins.detail.section`（画廊，只在 subject 是本 bundle 时渲染）。后两个是 `ui-plugin-manager` 自己声明的槽位，所以第三方 bundle 不用改 DSH 就能挂上去。
 
-它是**手写产物、没有构建步骤**：浏览器端只执行 `window.__ModuleLoader__.load({ id, factory })` 这种 classic script，格式就是仓库里 `packages/client/tsdown.client.ts` 产出的那套，所以脱离仓库也能零工具链发布；代价是要写 `React.createElement` 而不是 JSX。认领了这个键，这个工具的**所有**状态就都由这张卡片负责（包括进行中和失败），所以卡片同时处理 running / 无附件 / 加载失败三种情况。卡片里少量文案是硬编码英文，没走仓库的 locale 字典 —— 那由 `verify-client-ui-i18n` 管，本包不在该门禁范围内。
+它是**手写产物、没有构建步骤**：浏览器端只执行 `window.__ModuleLoader__.load({ id, factory })` 这种 classic script，格式就是仓库里 `packages/client/tsdown.client.ts` 产出的那套，所以脱离仓库也能零工具链发布；代价是要写 `React.createElement` 而不是 JSX。认领了这个键，这个工具的**所有**状态就都由这张卡片负责（包括进行中和失败），所以卡片同时处理 running / 无附件 / 加载失败三种情况。三处界面的文案全部走本包自己注册的 `ctx.locale` 命名空间 `imagegen`（没有 locale 服务时按 `navigator.language` 选一份内置字典），控件则是照抄宿主的副本 —— 这个模块向模块表要的只有 `react` 和 `react-dom`，多要一个 Harness 客户端包都会让加载失败。
 
 ## 自检
 
@@ -304,12 +321,13 @@ cd <本包目录>
 node smoke.mjs          # 或 pnpm test
 ```
 
-覆盖（**70 项**）：
+覆盖（**79 项**）：
 
 - **纯函数**：端点解析（含 generations ↔ edits 推导）、参数校验（`image`/`mask`/`background`+`jpeg` 冲突/`extra` 合并/未知参数拒绝）、两种请求体构造、模型可见文本里的路径拼法、响应用量字段的读取与清洗。
 - **对本地 stub 服务真跑一遍 `execute`**：JSON 与 multipart 两条路 + 落盘字节比对 + 读不到文件/非图片的报错 + 索引记录内容（含 `usage`）。
 - **插件页那一面**：状态目录与覆盖文件的读写与清洗、凭据的写/清除/被启动环境遮挡或被 profile 固定时的拒绝、图片索引、**全部 8 条路由**（含「按 id 而非路径取图」和「open/reveal 对未知 id 不启动任何进程」）、连通性探测的三种结果。
-- **客户端半边**：把 `client.js` 放进 `node:vm`、按模块加载器的方式执行，用桩 React 驱动 `apply`，校验三处注册的名称/key/id 与译文字典，并渲染每个界面的首屏状态 —— 这同时证明**拿不到 `ui-primitives` 时会退回原生元素而不是加载失败**。
+- **`image_library` 工具**：list 的字段与路径、status 不回显密钥、configure 走与页面相同的写入并能清空恢复、**拒绝写凭据**、非法 action/参数、按 id 删除、以及只有只读 action 声明并发安全。
+- **客户端半边**：把 `client.js` 放进 `node:vm`、按模块加载器的方式执行，用桩 React 驱动 `apply`，校验三处注册的名称/key/id 与译文字典，并渲染每个界面的首屏状态 —— 其中「只请求 `react` 与 `react-dom`」这一项是硬约束：模块表里任何别的 specifier 都会让加载直接失败。
 
 > ⚠️ 仍然没有被自动化覆盖的是**真实 DOM 里的交互**（点击、灯箱、剪贴板、文件管理器定位）—— 本机没有浏览器自动化，这部分只能在真实 GUI 里看。
 > 跑 smoke **不需要** key、不需要 endpoint，也不会碰你真实的 `~/.dsh/imagegen`：它在开头就把 `DSH_HOME` 指向临时目录，结束时还原。
@@ -332,11 +350,11 @@ git 和 tarball 都不需要 pnpm 的 `allowBuilds` 放行，因为包里没有 
 
 ## 设计取舍
 
-- **零 `@deepseek-ai/dsh-*` 运行时导入。** 用 `ctx.tools.register()` + 原始 JSON Schema，而不是 `defineTool`；用自己写的 `resolveConfig`/`parseArgs`，而不是 Schemastery 的 `Config`。DSH 是 pre-stable，这样升级最多是注册契约变，不会连模块解析一起挂。
+- **零 `@deepseek-ai/dsh-*` 运行时导入。** 用 `ctx.tools.register()` + 原始 JSON Schema，而不是 `defineTool`；用自己写的 `resolveConfig`/`parseArgs`，而不是 Schemastery 的 `Config`。浏览器半边同样不 import 宿主的客户端包：控件是照抄来的副本。DSH 是 pre-stable，这样升级最多是注册契约变，不会连模块解析一起挂。**这一条护得住「包不在」，护不住「包在但契约变了」** —— 后者会在渲染时抛异常，把这个槽位条目整个清空，而认领了 `generate_image` 就等于接管了它的失败状态，所以连报错都看不见了。
 - **无构建步骤。** 纯 ESM JS，源码即产物。
 - **endpoint 和 key 都在调用时解析。** 自包含的错误（显式 baseUrl 格式错、config 字段类型错）在加载期就报错；只有凭据面能给的值留到调用时，因为它们本来就会轮换。
 - **凭据请求 `redirect: 'error'`。** 不把 `Bearer` 自动转发到别的 origin。
-- **UI 挂在既有槽位上，不碰 DSH 源码。** 配置区与画廊认领的是 `ui-plugin-manager` 自己声明的槽位，控件来自 shell 预置的 `ui-primitives`（拿不到就退回原生元素）。代价是样式只能用内联样式而不是 CSS Modules，文案走自己注册的 `ctx.locale` 命名空间而不是仓库的类型化字典。
+- **UI 挂在既有槽位上，不碰 DSH 源码。** 配置区与画廊认领的是 `ui-plugin-manager` 自己声明的槽位。控件不是从宿主包里 import 的：`Button` / `Input` 逐条照抄 `ui-primitives` 的 `Button.tsx` / `Input.tsx` 与它们的 CSS module，类名换成 `imagegen-` 前缀，颜色只引用 `--dsw-*` 令牌，样式元素随用到它的界面一起挂载。代价是这份副本要自己跟着宿主的设计走，好处是宿主改那个包不会让这里的界面在渲染时炸掉（见「设计取舍」第一条）。文案走自己注册的 `ctx.locale` 命名空间而不是仓库的类型化字典。
 - **能改的值分两处存，各按各的语义来。** 地址和 KEY 交给凭据面（`set`/`unset`，有 watch、下一步调用就生效，且 `describe` 从不回显密钥）；其余五个字段写插件自己的 JSON 覆盖文件。没有为了「统一」把密钥塞进配置文件。
 - **不给插件页开任意路径读取。** 图片只按索引里的 id 取，页面拿不到「读任意文件」的能力。
 
@@ -349,5 +367,6 @@ git 和 tarball 都不需要 pnpm 的 `allowBuilds` 放行，因为包里没有 
 - 用 Node `fs` 直接写盘，不走 `ctx.fs` 的沙箱策略；写入位置完全由 `outputDir`（配置、插件页覆盖或单次参数）决定。
 - **画廊没有真缩略图**：不引图像解码库，缩略图就是原图字节 + `loading="lazy"` + `private, max-age=31536000, immutable`。一页 24 张时只请求可见的那几张，但输出目录里全是几 MB 的大图、又一次性列几百张时会比较费流量。
 - 索引最多保留最新 **500** 条；更早的图片仍在磁盘上，只是不再出现在画廊里（也不占索引体积）。
-- **插件页界面的交互行为没有自动化测试**（点击、灯箱、剪贴板、系统定位），只有加载与首屏渲染被 VM 覆盖；真要改动它们，请在真实 GUI 里过一遍。
+- **插件页界面的交互行为没有自动化测试**（点击、灯箱、剪贴板、系统定位），只有加载与首屏渲染被 VM 覆盖；灯箱的焦点恢复、Tab 圈定与 `role="dialog"` 结构是在真实 GUI 里才成立的，改完请过一眼。
+- `image_library` 不能改 `baseUrl` 与 `apiKey`：端点与密钥只由用户在插件页或凭据面写入，工具只报告它们的状态。
 - 只服务**生成流程写出来的**图片：手工放进输出目录的文件不会进索引，因而也不在画廊里。

@@ -13,10 +13,10 @@
  * The harness home is redirected to a temporary directory before anything
  * touches it, so a test run never reads or writes the real `~/.dsh/imagegen`.
  *
- * Scope note: this file covers the **server half** (`index.js`). The original
- * scratch-directory smoke also loaded `client.js` in a VM and drove the card
- * render; that copy was lost with the source directory, so the client half is
- * currently only exercised by starting the GUI (see README「自检」).
+ * It also loads `client.js` in a VM the way the Web shell does, drives every
+ * surface it registers to its first render, and proves the module asks the
+ * module table for nothing beyond `react` and `react-dom`; DOM behaviour and
+ * the host round trip still need the GUI (see README「自检」).
  */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -35,7 +35,9 @@ import {
   buildStatus,
   createRuntime,
   defineGenerateImage,
+  defineImageLibrary,
   MAX_INPUT_IMAGES,
+  MAX_PAGE_SIZE,
   modelsUrl,
   OVERRIDE_FIELDS,
   parseArgs,
@@ -45,6 +47,7 @@ import {
   readUsage,
   recordGeneratedImages,
   redactCredentials,
+  renderLibraryResult,
   renderResult,
   requestKind,
   resolveConfig,
@@ -636,6 +639,100 @@ try {
   await rm(routeDir, { recursive: true, force: true })
 }
 
+console.log('the image_library tool')
+const toolDir = await mkdtemp(join(tmpdir(), 'dsh-imagegen-library-'))
+const homeBeforeTool = process.env.DSH_HOME
+process.env.DSH_HOME = join(toolDir, 'home')
+
+const toolImage = join(toolDir, 'image-1.png')
+await writeFile(toolImage, PNG)
+const toolConfig = resolveConfig({ outputDir: toolDir })
+const toolRuntime = createRuntime(toolConfig)
+await recordGeneratedImages(toolRuntime.stateDir, [{
+  id: 'image-1',
+  createdAt: '2026-09-27T00:00:00.000Z',
+  path: toolImage,
+  name: 'image-1.png',
+  mimeType: 'image/png',
+  bytes: PNG.byteLength,
+  prompt: 'a cat',
+  model: 'stub-model',
+  size: '1024x1024',
+  mode: 'generations',
+  width: 1024,
+  height: 1024,
+}])
+const libraryTool = defineImageLibrary(fakeCtx(fakeCredentialProvider({ IMAGE_API_KEY: 'k' })), toolConfig, toolRuntime)
+
+try {
+  await checkAsync('the tool lists the index with ids and paths', async () => {
+    const value = await libraryTool.execute({ action: 'list' })
+    assert.equal(value.total, 1)
+    assert.equal(value.hasMore, false)
+    assert.deepEqual(value.images.map(one => one.id), ['image-1'])
+    assert.equal(value.images[0].path, toolImage)
+    assert.equal(value.images[0].width, 1024)
+    assert.match(renderLibraryResult(value), /image-1/)
+  })
+
+  await checkAsync('a listed image carries no undefined field into the result schema', async () => {
+    const value = await libraryTool.execute({ action: 'list' })
+    for (const one of value.images) {
+      for (const [field, held] of Object.entries(one)) assert.notEqual(held, undefined, field)
+    }
+  })
+
+  await checkAsync('the tool reports status without echoing the credential', async () => {
+    const value = await libraryTool.execute({ action: 'status' })
+    assert.equal(value.status.apiKey.configured, true)
+    assert.equal('value' in value.status.apiKey, false)
+    assert.match(renderLibraryResult(value), /endpoint/)
+  })
+
+  await checkAsync('the tool refuses to write a credential at all', async () => {
+    // The endpoint and the key are the user's to place; a model that could
+    // rewrite them could redirect every later generation.
+    await assert.rejects(() => libraryTool.execute({ action: 'configure', field: 'apiKey', value: 'sk-x' }), /Plugins page/)
+    await assert.rejects(() => libraryTool.execute({ action: 'configure', field: 'baseUrl', value: 'https://x.test' }), /Plugins page/)
+  })
+
+  await checkAsync('the tool configures a tunable through the write the page uses', async () => {
+    const value = await libraryTool.execute({ action: 'configure', field: 'size', value: '1536x1024' })
+    assert.equal(value.status.fields.size, '1536x1024')
+    assert.equal(toolRuntime.effective().size, '1536x1024')
+    const cleared = await libraryTool.execute({ action: 'configure', field: 'size', value: null })
+    assert.equal(cleared.status.fields.size, toolConfig.size)
+    assert.equal(toolRuntime.effective().size, toolConfig.size)
+    await assert.rejects(() => libraryTool.execute({ action: 'configure', field: 'nope', value: 'x' }), /unknown field/)
+  })
+
+  await checkAsync('the tool rejects an unknown action and unusable arguments', async () => {
+    await assert.rejects(() => libraryTool.execute({ action: 'nope' }), /action must be one of/)
+    await assert.rejects(() => libraryTool.execute(null), /arguments must be an object/)
+    await assert.rejects(() => libraryTool.execute({ action: 'list', limit: 0 }), /limit must be an integer/)
+    await assert.rejects(() => libraryTool.execute({ action: 'list', limit: MAX_PAGE_SIZE + 1 }), /limit must be an integer/)
+    await assert.rejects(() => libraryTool.execute({ action: 'delete' }), /needs id/)
+  })
+
+  await checkAsync('the tool deletes exactly the image it names', async () => {
+    const value = await libraryTool.execute({ action: 'delete', id: 'image-1' })
+    assert.equal(value.id, 'image-1')
+    assert.deepEqual(await readImageIndex(toolRuntime.stateDir), [])
+    await assert.rejects(() => readFile(toolImage))
+    await assert.rejects(() => libraryTool.execute({ action: 'delete', id: 'image-1' }), /unknown image id/)
+  })
+
+  await checkAsync('only the read-only actions overlap another call', async () => {
+    for (const action of ['list', 'status', 'test']) assert.equal(libraryTool.isConcurrencySafe({ action }), true)
+    for (const action of ['configure', 'delete', 'open', 'reveal']) assert.equal(libraryTool.isConcurrencySafe({ action }), false)
+    assert.equal(libraryTool.isConcurrencySafe(null), false)
+  })
+} finally {
+  if (homeBeforeTool === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = homeBeforeTool
+  await rm(toolDir, { recursive: true, force: true })
+}
+
 console.log('connectivity probe')
 const probeServer = createServer((req, res) => {
   if (req.url === '/v1/models') {
@@ -701,8 +798,7 @@ try {
     const { ctx, tools } = applyCtx({ onInject: (deps) => { seen.push(deps) } })
     apply(ctx, { model: 'stub-model' })
     assert.deepEqual(seen, [['connection']])
-    assert.equal(tools.length, 1)
-    assert.equal(tools[0].name, 'generate_image')
+    assert.deepEqual(tools.map(one => one.name), ['generate_image', 'image_library'])
     assert.equal(typeof tools[0].execute, 'function')
     assert.equal(tools[0].timeoutMs, 300_000)
   })
@@ -727,7 +823,7 @@ try {
       },
     })
     apply(ctx, { model: 'stub-model' })
-    assert.equal(tools.length, 1)
+    assert.deepEqual(tools.map(one => one.name), ['generate_image', 'image_library'])
     assert.deepEqual(routes.map(one => one.path), [
       `${ROUTE_PREFIX}/status`,
       `${ROUTE_PREFIX}/update`,
@@ -785,14 +881,18 @@ function loadBrowserHalf() {
     useRef: (initial) => ({ current: initial }),
     useCallback: (callback) => callback,
   }
-  // `ui-primitives` is deliberately absent: the module must fall back to plain
-  // elements instead of failing to load, which is the whole point of its guard.
+  // The bundle owns its controls, so the only modules it may reach for are the
+  // two the shell seeds for everyone. A request for anything else — a Harness
+  // Client package in particular — fails the load here instead of surviving
+  // until that package changes shape.
+  const requested = []
   const moduleExports = entry.factory((specifier) => {
+    requested.push(specifier)
     if (specifier === 'react') return react
     if (specifier === 'react-dom') return { createPortal: (node) => node }
     throw new Error(`unexpected require(${specifier})`)
   })
-  return moduleExports
+  return { moduleExports, requested }
 }
 
 /** Every string a rendered tree carries, so assertions read as the reader does. */
@@ -810,7 +910,7 @@ function textsOf(node, found = []) {
   return found
 }
 
-const browserHalf = loadBrowserHalf()
+const { moduleExports: browserHalf, requested } = loadBrowserHalf()
 const registrations = []
 const browserCtx = {
   get: () => undefined,
@@ -830,6 +930,11 @@ const browserT = registrationFor('tool.call.toolview').options.inject().t
 check('the module registers under its package name and injects only slots', () => {
   assert.deepEqual([...browserHalf.inject], ['slots'])
   assert.equal(typeof browserHalf.apply, 'function')
+})
+check('the browser half reaches for react and react-dom, nothing else', () => {
+  // A Harness Client package would be a dependency this bundle cannot track:
+  // it would fail later, while rendering, and blank the slot entry.
+  assert.deepEqual(requested, ['react', 'react-dom'])
 })
 check('it claims the tool card and both Plugins-page surfaces', () => {
   assert.deepEqual(registrations.map(one => one.options.name), [

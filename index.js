@@ -121,6 +121,9 @@ export const ROUTE_PREFIX = '/api/imagegen'
 /** Images one list response returns when the caller names no size. */
 export const DEFAULT_PAGE_SIZE = 24
 
+/** Images the `image_library` tool lists when the call names no size. */
+export const LIBRARY_PAGE_SIZE = 20
+
 /** Largest page one list response returns, bounding a single response. */
 export const MAX_PAGE_SIZE = 100
 
@@ -1190,6 +1193,124 @@ function pageSize(raw) {
   return Math.min(MAX_PAGE_SIZE, parsed)
 }
 
+/** Parse an `offset` query parameter into a non-negative index. */
+function pageOffset(raw) {
+  const parsed = Number.parseInt(raw ?? '', 10)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 0
+}
+
+/* ------------------------------------------------------------------ *
+ * Operations: one implementation per action, called by both the Plugins
+ * page's routes and the `image_library` tool, so the two callers cannot
+ * drift apart.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Build one failed operation, carrying the HTTP status the route reports for
+ * it. The tool path ignores that status and surfaces the message.
+ *
+ * @param status - HTTP status the route answers with.
+ * @param message - what went wrong, spelled for a reader.
+ * @returns The error to throw.
+ */
+function operationError(status, message) {
+  const error = new Error(message)
+  error.status = status
+  return error
+}
+
+/**
+ * The record one indexed id names.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param id - the id the caller named.
+ * @returns The record, or undefined when nothing indexed carries that id.
+ */
+export async function findImageRecord(stateDir, id) {
+  return (await readImageIndex(stateDir)).find(entry => entry.id === id)
+}
+
+/**
+ * One page of the index, newest first.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param page - the bounded `limit` and the `offset` to start at.
+ * @returns The page's records, the total count, and whether more follow.
+ */
+export async function listImages(stateDir, page) {
+  const all = await readImageIndex(stateDir)
+  return {
+    total: all.length,
+    hasMore: page.offset + page.limit < all.length,
+    items: all.slice(page.offset, page.offset + page.limit),
+  }
+}
+
+/**
+ * Remove one image and its index record.
+ *
+ * The record goes first, so a file this process cannot remove — already gone,
+ * or held by another program — is logged instead of staying indexed forever.
+ *
+ * @param ctx - plugin context, for the warning.
+ * @param stateDir - the plugin's state directory.
+ * @param id - the id to remove.
+ * @returns The removed record.
+ * @throws When no indexed record carries that id.
+ */
+export async function deleteImage(ctx, stateDir, id) {
+  const all = await readImageIndex(stateDir)
+  const record = all.find(entry => entry.id === id)
+  if (record === undefined) throw operationError(404, `unknown image id ${JSON.stringify(id)}`)
+  await writeImageIndex(stateDir, all.filter(entry => entry.id !== id))
+  try {
+    await unlink(record.path)
+  } catch (error) {
+    warn(ctx, error)
+  }
+  return record
+}
+
+/**
+ * Hand one image to the operating system, or select it in the file manager.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param id - the id to hand over.
+ * @param action - `open` the file itself, or `reveal` it in the file manager.
+ * @returns The record that was handed over.
+ * @throws When the id is unknown, the platform has no launcher, or it fails.
+ */
+export async function handOffImage(stateDir, id, action) {
+  const record = await findImageRecord(stateDir, id)
+  if (record === undefined) throw operationError(404, `unknown image id ${JSON.stringify(id)}`)
+  const spec = systemOpenCommand(process.platform, record.path, action)
+  if (spec === undefined) {
+    throw operationError(501, `this plugin cannot open files on ${process.platform}`)
+  }
+  try {
+    await launchDetached(spec.command, spec.args)
+  } catch (error) {
+    throw operationError(500, messageOf(error))
+  }
+  return record
+}
+
+/**
+ * Ask the relay whether the configured base and credential reach it at all.
+ *
+ * @param ctx - plugin context.
+ * @param config - resolved config.
+ * @returns The probe's outcome.
+ * @throws When no base or no credential is configured yet.
+ */
+export async function testConnection(ctx, config) {
+  const base = config.baseUrl ?? await resolveNamed(ctx, config.baseUrlEnv)
+  if (base === undefined) throw operationError(400, `no API base — save ${config.baseUrlEnv} first`)
+  const apiKey = config.apiKey ?? await resolveNamed(ctx, config.apiKeyEnv)
+  if (apiKey === undefined) throw operationError(400, `no credential for ${config.apiKeyEnv} — save it first`)
+  return probeConnection(base, apiKey)
+}
+
 /**
  * Every route the Plugins page calls. All of them sit under `/api`, so the
  * connection service has already applied its host/origin fence and browser
@@ -1202,24 +1323,19 @@ function pageSize(raw) {
  * @returns The routes to register on the connection's fetch table.
  */
 export function buildRoutes(ctx, config, runtime) {
-  const findRecord = async (id) => (await readImageIndex(runtime.stateDir)).find(entry => entry.id === id)
   const readBodyId = async (request) => {
     const body = await readJsonBody(request)
     return body !== undefined && isFilledString(body.id) ? String(body.id) : undefined
   }
+  // One place turns a failed operation into the status its route reports.
+  const failed = (error) => jsonResponse({ ok: false, error: messageOf(error) }, error.status ?? 500)
   const openRoute = (action) => async (request) => {
     const id = await readBodyId(request)
     if (id === undefined) return jsonResponse({ ok: false, error: 'a JSON body with an image id is required' }, 400)
-    const record = await findRecord(id)
-    if (record === undefined) return jsonResponse({ ok: false, error: 'unknown image id' }, 404)
-    const spec = systemOpenCommand(process.platform, record.path, action)
-    if (spec === undefined) {
-      return jsonResponse({ ok: false, error: `this plugin cannot open files on ${process.platform}` }, 501)
-    }
     try {
-      await launchDetached(spec.command, spec.args)
+      await handOffImage(runtime.stateDir, id, action)
     } catch (error) {
-      return jsonResponse({ ok: false, error: messageOf(error) }, 500)
+      return failed(error)
     }
     return jsonResponse({ ok: true })
   }
@@ -1249,15 +1365,11 @@ export function buildRoutes(ctx, config, runtime) {
       methods: ['POST'],
       requestBody: 'buffered',
       fetch: async () => {
-        const base = config.baseUrl ?? await resolveNamed(ctx, config.baseUrlEnv)
-        if (base === undefined) {
-          return jsonResponse({ ok: false, error: `no API base — save ${config.baseUrlEnv} first` }, 400)
+        try {
+          return jsonResponse({ ok: true, probe: await testConnection(ctx, config) })
+        } catch (error) {
+          return failed(error)
         }
-        const apiKey = config.apiKey ?? await resolveNamed(ctx, config.apiKeyEnv)
-        if (apiKey === undefined) {
-          return jsonResponse({ ok: false, error: `no credential for ${config.apiKeyEnv} — save it first` }, 400)
-        }
-        return jsonResponse({ ok: true, probe: await probeConnection(base, apiKey) })
       },
     },
     {
@@ -1266,15 +1378,11 @@ export function buildRoutes(ctx, config, runtime) {
       requestBody: 'buffered',
       fetch: async (request) => {
         const params = new URL(request.url).searchParams
-        const limit = pageSize(params.get('limit'))
-        const offset = Math.max(0, Number.parseInt(params.get('offset') ?? '0', 10) || 0)
-        const all = await readImageIndex(runtime.stateDir)
-        return jsonResponse({
-          ok: true,
-          total: all.length,
-          hasMore: offset + limit < all.length,
-          items: all.slice(offset, offset + limit),
+        const page = await listImages(runtime.stateDir, {
+          limit: pageSize(params.get('limit')),
+          offset: pageOffset(params.get('offset')),
         })
+        return jsonResponse({ ok: true, ...page })
       },
     },
     {
@@ -1283,7 +1391,7 @@ export function buildRoutes(ctx, config, runtime) {
       requestBody: 'buffered',
       fetch: async (request) => {
         const id = new URL(request.url).searchParams.get('id')
-        const record = isFilledString(id) ? await findRecord(String(id)) : undefined
+        const record = isFilledString(id) ? await findImageRecord(runtime.stateDir, String(id)) : undefined
         if (record === undefined) return jsonResponse({ ok: false, error: 'unknown image id' }, 404)
         let bytes
         try {
@@ -1313,16 +1421,10 @@ export function buildRoutes(ctx, config, runtime) {
       fetch: async (request) => {
         const id = await readBodyId(request)
         if (id === undefined) return jsonResponse({ ok: false, error: 'a JSON body with an image id is required' }, 400)
-        const all = await readImageIndex(runtime.stateDir)
-        const record = all.find(entry => entry.id === id)
-        if (record === undefined) return jsonResponse({ ok: false, error: 'unknown image id' }, 404)
-        await writeImageIndex(runtime.stateDir, all.filter(entry => entry.id !== id))
         try {
-          await unlink(record.path)
+          await deleteImage(ctx, runtime.stateDir, id)
         } catch (error) {
-          // The record is already gone, so a file this process cannot remove
-          // (already deleted, or held by another program) is reported, not fatal.
-          warn(ctx, error)
+          return failed(error)
         }
         return jsonResponse({ ok: true, id })
       },
@@ -1522,9 +1624,261 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * `image_library`: the same operations, reachable from the agent.
+ * ------------------------------------------------------------------ */
+
+/** Actions the tool accepts; the first three change nothing. */
+export const LIBRARY_ACTIONS = ['list', 'status', 'test', 'configure', 'delete', 'open', 'reveal']
+
+/** Actions that change no state, so overlapping calls cannot interfere. */
+const READ_ONLY_ACTIONS = ['list', 'status', 'test']
+
 /**
- * Register `generate_image` on the tool registry, and the Plugins page's routes
+ * Fields this tool refuses to write. The endpoint and the credential are the
+ * user's to place, through the Plugins page or the credential store: a caller
+ * that could rewrite them could redirect or capture every later generation.
+ */
+const CREDENTIAL_FIELDS = ['baseUrl', 'apiKey']
+
+/** Fields one indexed image reports, in the order the tool's schema lists them. */
+const LIBRARY_IMAGE_FIELDS = ['name', 'createdAt', 'prompt', 'model', 'size', 'mode', 'width', 'height']
+
+/**
+ * One index record as the tool reports it: identity, provenance, and size.
+ *
+ * A field the record does not carry stays absent rather than arriving as null,
+ * because the tool's output schema types each one.
+ *
+ * @param record - one record from the image index.
+ * @returns The reportable fields.
+ */
+function libraryImage(record) {
+  const image = { id: record.id, path: record.path, mimeType: record.mimeType, bytes: record.bytes }
+  for (const field of LIBRARY_IMAGE_FIELDS) {
+    if (record[field] !== undefined) image[field] = record[field]
+  }
+  return image
+}
+
+/**
+ * One integer argument, bounded, with a default for an absent one.
+ *
+ * @param value - the raw argument.
+ * @param bounds - the field name, its default, and its inclusive range.
+ * @returns The accepted integer.
+ * @throws When a supplied value is not an integer in range.
+ */
+function boundedInteger(value, bounds) {
+  if (value === undefined) return bounds.fallback
+  if (!Number.isInteger(value) || value < bounds.min || value > bounds.max) {
+    throw new Error(`image_library: ${bounds.field} must be an integer from ${bounds.min} to ${bounds.max}`)
+  }
+  return value
+}
+
+/**
+ * Run one `image_library` action against the operations the Plugins page uses.
+ *
+ * @param ctx - plugin context.
+ * @param config - resolved Loader config.
+ * @param runtime - the override holder.
+ * @param args - raw tool arguments.
+ * @returns The action's result, always naming the action it came from.
+ * @throws When the action or its arguments are unusable, or the operation fails.
+ */
+export async function runLibraryAction(ctx, config, runtime, args) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+    throw new Error('image_library: arguments must be an object')
+  }
+  if (!LIBRARY_ACTIONS.includes(args.action)) {
+    throw new Error(`image_library: action must be one of ${LIBRARY_ACTIONS.join(', ')}`)
+  }
+  const action = args.action
+  if (action === 'list') {
+    const limit = boundedInteger(args.limit, { field: 'limit', fallback: LIBRARY_PAGE_SIZE, min: 1, max: MAX_PAGE_SIZE })
+    const offset = boundedInteger(args.offset, { field: 'offset', fallback: 0, min: 0, max: Number.MAX_SAFE_INTEGER })
+    const page = await listImages(runtime.stateDir, { limit, offset })
+    return { action, offset, total: page.total, hasMore: page.hasMore, images: page.items.map(libraryImage) }
+  }
+  if (action === 'status') {
+    return { action, status: await buildStatus(ctx, config, runtime) }
+  }
+  if (action === 'test') {
+    return { action, probe: await testConnection(ctx, config) }
+  }
+  if (action === 'configure') {
+    if (!isFilledString(args.field)) throw new Error('image_library: configure needs `field`')
+    if (CREDENTIAL_FIELDS.includes(args.field)) {
+      throw new Error(`image_library: ${args.field} is a credential — set it on the imagegen Plugins page, not from a tool call`)
+    }
+    const value = args.value === undefined ? null : args.value
+    const failure = await applyUpdate(ctx, config, runtime, { field: args.field, value })
+    if (failure !== undefined) throw new Error(`image_library: ${failure}`)
+    return { action, status: await buildStatus(ctx, config, runtime) }
+  }
+  if (!isFilledString(args.id)) throw new Error(`image_library: ${action} needs id`)
+  const id = String(args.id)
+  if (action === 'delete') {
+    const record = await deleteImage(ctx, runtime.stateDir, id)
+    return { action, id: record.id, path: record.path }
+  }
+  const record = await handOffImage(runtime.stateDir, id, action)
+  return { action, id: record.id, path: record.path }
+}
+
+/**
+ * Render one `image_library` result as model-facing text.
+ *
+ * @param value - the action's result.
+ * @returns A summary, plus one line per image for `list`.
+ */
+export function renderLibraryResult(value) {
+  if (value.action === 'list') {
+    if (value.total === 0) return 'No images are indexed on this machine yet.'
+    const lines = [`${value.images.length} of ${value.total} image(s), newest first${value.offset > 0 ? `, from index ${value.offset}` : ''}:`]
+    for (const image of value.images) {
+      const dimensions = image.width === undefined ? '' : `, ${image.width}x${image.height}`
+      lines.push(`- ${image.id}: ${markdownPath(image.path)} (${image.mimeType}, ${image.bytes} bytes${dimensions})`)
+      if (image.prompt !== undefined) lines.push(`  prompt: ${image.prompt}`)
+    }
+    if (value.hasMore) lines.push(`More follow: call again with offset ${value.offset + value.images.length}.`)
+    return lines.join('\n')
+  }
+  if (value.action === 'status' || value.action === 'configure') {
+    const status = value.status
+    const endpoint = status.baseUrl.pinned
+      ? 'fixed by the profile configuration'
+      : status.baseUrl.configured ? 'configured' : 'not configured'
+    const lines = [
+      'Image settings now in effect:',
+      `- endpoint: ${endpoint}${status.baseUrl.value === undefined ? '' : ` (${status.baseUrl.value})`}`,
+      `- ${status.apiKey.ref}: ${status.apiKey.configured ? 'configured' : 'not configured'}`,
+    ]
+    for (const field of OVERRIDE_FIELDS) {
+      const source = status.overrides[field] === undefined ? 'profile config or built-in default' : 'Plugins-page override'
+      lines.push(`- ${field}: ${status.fields[field] ?? 'unset'} (${source})`)
+    }
+    lines.push(`- state directory: ${markdownPath(status.stateDir)}`)
+    return lines.join('\n')
+  }
+  if (value.action === 'test') {
+    const probe = value.probe
+    if (probe.ok) return `The relay answered HTTP ${probe.status} at ${probe.url}; the endpoint and the credential both work.`
+    return `${probe.inconclusive === true ? 'Inconclusive' : 'Failed'}: ${probe.detail ?? `HTTP ${probe.status}`}`
+  }
+  if (value.action === 'delete') return `Deleted ${value.id} and its index record: ${markdownPath(value.path)}`
+  return value.action === 'open'
+    ? `Opened ${markdownPath(value.path)} with the system default application.`
+    : `Selected ${markdownPath(value.path)} in the file manager.`
+}
+
+/**
+ * The `image_library` tool definition: the gallery and settings operations the
+ * Plugins page offers, reachable from the agent through the same functions.
+ *
+ * @param ctx - plugin context supplying the credential seam.
+ * @param config - resolved config.
+ * @param runtime - holder for the values the Plugins page can change; a fresh
+ *   one is built when a caller registers the tool on its own.
+ * @returns The definition passed to `ctx.tools.register`.
+ */
+export function defineImageLibrary(ctx, config, runtime = createRuntime(config)) {
+  return {
+    name: 'image_library',
+    description: 'Inspect and manage the images generate_image produced, and read or change that tool\'s own settings. '
+      + '`list` reports what is indexed, with each image\'s id and path; `status` reports where the endpoint and the credential come from and the values now in effect; '
+      + '`test` asks the relay whether the configured endpoint and credential reach it; '
+      + '`configure` sets one setting for later calls; `delete` removes one image and its index record; `open` and `reveal` hand one image to the system. '
+      + 'The endpoint and the API key are the user\'s to place on the imagegen Plugins page: this tool reports their state and refuses to write them.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: LIBRARY_ACTIONS,
+          description: 'What to do. `list`, `status`, and `test` change nothing.',
+        },
+        id: {
+          type: 'string',
+          description: 'Image id, as `list` reports it. Required by `delete`, `open`, and `reveal`.',
+        },
+        limit: {
+          type: 'integer',
+          description: `Images one \`list\` returns, 1 to ${MAX_PAGE_SIZE}. Defaults to ${LIBRARY_PAGE_SIZE}.`,
+        },
+        offset: { type: 'integer', description: 'Index to start `list` at. Defaults to 0.' },
+        field: {
+          type: 'string',
+          description: `The setting \`configure\` writes: ${OVERRIDE_FIELDS.join(', ')}.`,
+        },
+        value: {
+          type: ['string', 'integer', 'null'],
+          description: 'What `configure` writes. A null clears the setting, so the profile config or the built-in default applies again.',
+        },
+      },
+      required: ['action'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string' },
+          offset: { type: 'integer' },
+          total: { type: 'integer' },
+          hasMore: { type: 'boolean' },
+          images: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string' },
+                path: { type: 'string' },
+                name: { type: 'string' },
+                mimeType: { type: 'string' },
+                bytes: { type: 'integer' },
+                createdAt: { type: 'string' },
+                prompt: { type: 'string' },
+                model: { type: 'string' },
+                size: { type: 'string' },
+                mode: { type: 'string' },
+                width: { type: 'integer' },
+                height: { type: 'integer' },
+              },
+              required: ['id', 'path', 'mimeType', 'bytes'],
+            },
+          },
+          status: { type: 'object', additionalProperties: true },
+          probe: { type: 'object', additionalProperties: true },
+          id: { type: 'string' },
+          path: { type: 'string' },
+        },
+        required: ['action'],
+      },
+      render: (_args, value) => [{ type: 'text', text: renderLibraryResult(value) }],
+    },
+    // Only the read-only actions may overlap another call.
+    isConcurrencySafe: (args) => args !== null
+      && typeof args === 'object'
+      && READ_ONLY_ACTIONS.includes(args.action),
+    async execute(args) {
+      // Overrides are read per call on the same terms as the credential, so an
+      // edit on the Plugins page applies to the next action.
+      runtime.overrides = await refreshOverrides(ctx, runtime)
+      return runLibraryAction(ctx, config, runtime, args)
+    },
+  }
+}
+
+/**
+ * Register both tools on the tool registry, and the Plugins page's routes
  * wherever a Web composition is present.
+ *
+ * `generate_image` produces images; `image_library` inspects and manages what
+ * it produced and the settings later calls use.
  *
  * @param ctx - plugin context; `tools` is required, `credentials` and
  *   `connection` optional.
@@ -1534,6 +1888,7 @@ export function apply(ctx, config) {
   const resolved = resolveConfig(config)
   const runtime = createRuntime(resolved)
   ctx.tools.register(defineGenerateImage(ctx, resolved, runtime))
+  ctx.tools.register(defineImageLibrary(ctx, resolved, runtime))
   // Warm the holder the tool's declared timeout is read from, so a value saved
   // on the Plugins page also bounds the first call after a restart.
   void refreshOverrides(ctx, runtime)
