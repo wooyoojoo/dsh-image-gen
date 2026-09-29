@@ -167,9 +167,9 @@ IMAGE_API_KEY=sk-...
 | `background` | 不传 | 透传字段的**默认值**（如 `transparent`）。单次调用的 `background` 覆盖它 |
 | `outputFormat` | 不传 | 透传字段的默认值（`png`/`jpeg`/`webp`），落成请求里的 `output_format` |
 | `timeoutMs` | `300000` | 单次调用预算。生图常见 30–120 秒，别调太小 |
-| `outputDir` | `process.cwd()` | 图片保存目录，自动创建 |
+| `outputDir` | `<DSH_HOME>/imagegen/output` | 图片保存目录，自动创建；**其下还会再按会话隔离一层** `sessions/s-<会话 id 后 12 位>/`。默认不是 `process.cwd()` —— 那样会让"从桌面启动"和"从检出启动"的会话把图片散到两处（实测散成 4 个目录） |
 
-其中 `model`、`size`、`quality`、`timeoutMs`、`outputDir` 五个可以在插件页改（见上一节），写进插件自己的覆盖文件，**优先级高于这张表里的 cordis 配置**；`baseUrl` / `apiKey` 也能在插件页改，但写的是凭据存储。每个字段在页面上都会标明当前来自哪一层。
+其中 `model`、`size`、`quality`、`timeoutMs`、`outputDir` 五个可以在插件页改（见上一节），写进插件自己的覆盖文件，**优先级高于这张表里的 cordis 配置**；`baseUrl` / `apiKey` 也能在插件页改，但写的是凭据存储。每个字段在页面上都会标明当前来自哪一层，且**三态分明**：已在插件页覆盖 / 来自 profile 配置（可覆盖）/ 内置默认值（两边都没配）—— 后两者原先共用一句话，会把"默认值"误读成"我配的"。
 
 要固定某台设备的值，在 `$DSH_HOME/profiles/<name>/cordis.patch.yml` 里按 `id` 覆盖这一行 —— **覆盖是整行替换 config，不深合并**，必须重述该行所有键：
 
@@ -203,8 +203,8 @@ IMAGE_API_KEY=sk-...
 | `input_fidelity` | string | 透传：例如 `high`，让结果尽量贴近输入图 |
 | `extra` | object | **逃生口**：任意其它字段原样进请求体；同名时显式参数优先 |
 | `providerOptions` | object | `extra` 的别名；两个都给时 `extra` 优先 |
-| `outputDir` | string | 本次落盘目录；相对路径相对配置的 `outputDir` 解析 |
-| `layout` | string | **精灵图布局**：`2x2` / `3x2` / `4x2` / `2x3` / `6x1`。插件把网格、阅读顺序、透明底、"不许跨格"等规则拼进 prompt，不必每次重写 |
+| `outputDir` | string | 本次落盘目录；相对路径相对配置的 `outputDir` 解析。实际写入位置是其下的 `sessions/s-<id>/`（会话隔离），记录里带 `session` 字段 |
+| `layout` | string | **精灵图布局**：`2x2` / `3x2` / `4x2` / `2x3` / `6x1`。插件把网格、阅读顺序、"不许跨格"等规则拼进 prompt，不必每次重写。**配合 `background: "transparent"` 时要求抠好的透明底；不带它则改成要求"每一格保持相同的构图/镜头/场景"**（不透明场景图用后者） |
 | `animationSet` | string | **动画集名**：同一套动画的所有帧共用一个名字 |
 | `animationRole` | string | 本帧角色：`key`（定版帧）/ `frame`（动作帧）/ `smear`（运动模糊的过渡帧）/ `vfx`（特效或受击资产）。必须与 `animationSet` 同给 |
 
@@ -260,6 +260,16 @@ IMAGE_API_KEY=sk-...
 - 2.5 的质量梯子相对 `gpt-image-2` **重新贴过标签**：`high` ≈ 旧 `medium` 的预算、`max` ≈ 旧 `high`。想要"以前 high 的效果"得用 `max`。
 - 档位也影响耗时：同批并发发起时，`max` 比 `high` 多约 27 秒（flare）到 67 秒（sunburst）。
 - `low` 的观感：本轮贴纸题材实测（n=1）**看不出明显劣化**；早先"切割发毛、渐变起噪"的结论待用细节密集的 prompt 复核。
+
+**尺寸也进账单，而且横向比纵向便宜一半**（同档 `high`，数字读自 `usage.output_tokens`）：
+
+| `size` | output tokens | 官价/张 | 实测场景 |
+|---|---|---|---|
+| `1536x1024`（横向） | **1,372** | $0.0412 | 3×2 精灵图最省的一档 |
+| `1024x1024`（方形） | 1,756 | $0.0527 | 单帧定版 |
+| `1024x1536`（纵向） | **2,744** | $0.0823 | 竖幅人像改图 |
+
+同样像素数，纵向是横向的 **2 倍** —— 所以**精灵图一律用横向**，竖幅只在确实需要时用。带输入图的编辑还要另算图片输入：实测一张 1024×1536 人像（2400 image tokens）+ 446 文字 ≈ **$0.021 输入**，叠加输出后单张约 **$0.10**。
 
 **flare vs sunburst**（同 prompt、同尺寸、同档位各一张）：
 

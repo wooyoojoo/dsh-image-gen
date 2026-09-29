@@ -327,7 +327,9 @@ export function resolveConfig(config) {
     outputFormat: raw.outputFormat,
     timeoutMs,
     attachImages: raw.attachImages ?? DEFAULT_ATTACH_IMAGES,
-    outputDir: raw.outputDir ?? process.cwd(),
+    // Left undefined here: the default needs the state directory, which only the
+    // runtime knows. See createRuntime.
+    outputDir: raw.outputDir,
   }
 }
 
@@ -422,23 +424,35 @@ export function normalizeImageEntries(value) {
  * The clause a sprite-sheet layout contributes: the grid, the reading order, and
  * the constraints that make the result sliceable.
  *
+ * The background sentence follows the request rather than the layout. A cut-out
+ * sheet needs `background: "transparent"` to come back with alpha at all, and
+ * only then does demanding an empty background describe what was asked for; an
+ * opaque sheet — a photographic scene with one moving element — needs the
+ * opposite instruction, that the framing, camera and scene stay identical in
+ * every cell.
+ *
  * Two measured facts are baked in: the model scales artwork to fill each cell,
  * so margins must be added in post rather than requested; and a cell narrower
  * than roughly 400px lets a swung prop cross into its neighbour.
  *
  * @param layout - a key of {@link LAYOUTS}.
+ * @param options - `transparent` marks a cut-out sheet, and defaults to true.
  * @returns The clause to append to the prompt.
  * @throws When the layout is unknown.
  */
-export function layoutClause(layout) {
+export function layoutClause(layout, { transparent = true } = {}) {
   const spec = LAYOUTS[layout]
   if (spec === undefined) {
     throw new Error(`imagegen: layout must be one of ${Object.keys(LAYOUTS).join(', ')}, got ${JSON.stringify(layout)}`)
   }
   const lines = [
     `Sprite-sheet layout: exactly ${spec.cols * spec.rows} frames in a ${spec.cols}-column by ${spec.rows}-row grid, read left to right and top row first; every frame is a distinct step of the motion.`,
-    'Only the artwork is opaque: fully transparent background with no background fill, no grid lines, no cell borders, no dividers and no frames around the cells.',
-    'Keep every frame inside its own cell with a margin, so nothing crosses a cell boundary; natural proportions, centred in the cell, never stretched to fill it.',
+    transparent
+      ? 'Only the artwork is opaque: fully transparent background with no background fill, no grid lines, no cell borders, no dividers and no frames around the cells.'
+      : 'The background is part of every frame: hold the framing, the camera angle and the scene identical in all the cells, and change only what the prompt names as moving. No grid lines, no cell borders, no dividers and no frames around the cells.',
+    transparent
+      ? 'Keep every frame inside its own cell with a margin, so nothing crosses a cell boundary; natural proportions, centred in the cell, never stretched to fill it.'
+      : 'Keep every frame inside its own cell, so nothing crosses a cell boundary; centred in the cell, never stretched to fill it.',
     'No text, no numbers, no captions, no watermark, no logo, and no motion blur unless the prompt asks for it.',
   ]
   if (spec.cols >= 5) {
@@ -469,7 +483,7 @@ export function referenceClause(roles) {
  */
 export function composePrompt(request) {
   const parts = [request.prompt]
-  if (request.layout !== undefined) parts.push(layoutClause(request.layout))
+  if (request.layout !== undefined) parts.push(layoutClause(request.layout, { transparent: request.background === 'transparent' }))
   const clause = referenceClause(request.imageRoles ?? [])
   if (clause !== undefined) parts.push(clause)
   return parts.join('\n\n')
@@ -621,6 +635,25 @@ export function appendEditFields(form, request) {
     form.append(key, typeof value === 'string' ? value : JSON.stringify(value))
   }
   return form
+}
+
+/**
+ * The folder name that isolates one session's images.
+ *
+ * A session's title is editable — `session/title` is its own event — so it makes
+ * a poor directory name: renaming a session would orphan its files. The session
+ * id never changes, and its last twelve characters are enough to keep sessions
+ * apart while staying short enough to read in a path.
+ *
+ * @param exec - the tool run context.
+ * @returns The folder name, or `undefined` when no session is attached (a bare test dispatch, for instance).
+ */
+export function sessionFolderName(exec) {
+  const id = exec?.agent?.session?.id ?? exec?.agent?.id
+  if (!isFilledString(id)) return undefined
+  const compact = String(id).replace(/[^a-zA-Z0-9]/g, '')
+  if (compact.length === 0) return undefined
+  return `s-${compact.length > 12 ? compact.slice(-12) : compact}`
 }
 
 /**
@@ -922,7 +955,12 @@ export function resolveStateDir(env = process.env, home = homedir()) {
  */
 export function createRuntime(config) {
   const runtime = { stateDir: resolveStateDir(), overrides: {} }
-  runtime.effective = () => ({ ...config, ...runtime.overrides })
+  // The library default is the plugin's own folder, never the process working
+  // directory: art lands in one place whatever directory the harness was
+  // launched from. A launcher on the Desktop and one in a checkout otherwise
+  // scatter the same user's images across both.
+  runtime.outputDir = join(runtime.stateDir, 'output')
+  runtime.effective = () => ({ ...config, outputDir: config.outputDir ?? runtime.outputDir, ...runtime.overrides })
   return runtime
 }
 
@@ -1301,7 +1339,17 @@ export async function buildStatus(ctx, config, runtime) {
     : { configured: true, source: 'config', writable: false }
   const effective = runtime.effective()
   const fields = {}
-  for (const field of OVERRIDE_FIELDS) fields[field] = effective[field] ?? null
+  // Where each tunable comes from decides what the page may say about it: an
+  // override can be cleared, a profile value can be overridden, and a built-in
+  // default is neither. Reporting one merged sentence for the last two taught a
+  // user that a value they never configured was their configuration.
+  const sources = {}
+  for (const field of OVERRIDE_FIELDS) {
+    fields[field] = effective[field] ?? null
+    sources[field] = runtime.overrides[field] !== undefined
+      ? 'override'
+      : config[field] !== undefined ? 'config' : 'default'
+  }
   return {
     baseUrl: {
       ref: config.baseUrlEnv,
@@ -1313,8 +1361,9 @@ export async function buildStatus(ctx, config, runtime) {
     },
     apiKey: { ref: config.apiKeyEnv, pinned: config.apiKey !== undefined, ...keyInfo },
     fields,
+    sources,
     overrides: { ...runtime.overrides },
-    defaults: { model: DEFAULT_MODEL, size: DEFAULT_SIZE, timeoutMs: DEFAULT_TIMEOUT_MS },
+    defaults: { model: DEFAULT_MODEL, size: DEFAULT_SIZE, timeoutMs: DEFAULT_TIMEOUT_MS, outputDir: runtime.outputDir },
     stateDir: runtime.stateDir,
   }
 }
@@ -1778,13 +1827,13 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
         },
         outputDir: {
           type: 'string',
-          description: 'Directory for the saved files. Defaults to the configured outputDir; a relative path resolves against it.',
+          description: 'Directory for the saved files. Defaults to the configured outputDir, which itself defaults to this plugin\'s own output folder under DSH_HOME; a relative path resolves against it.',
         },
         layout: {
           type: 'string',
           description: `Sprite-sheet layout: ${Object.keys(LAYOUTS).join(', ')}. `
-            + 'The plugin appends the grid, reading order, transparency and no-bleed clauses to the prompt, '
-            + 'so a sliceable sheet does not require restating those rules on every call.',
+            + 'The plugin appends the grid, reading order and no-bleed clauses to the prompt, so a sliceable sheet does not require restating those rules on every call. '
+            + 'Add `background: "transparent"` for a cut-out sheet; without it the clause instead demands that the framing, camera and scene stay identical in every cell, which is what an opaque sheet needs.',
         },
         animationSet: {
           type: 'string',
@@ -1855,7 +1904,11 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
       const { endpoint, apiKey } = await resolveTarget(ctx, effective, kind)
       const { entries, revisedPrompt, usage } = await requestImages(endpoint, apiKey, request, effective.timeoutMs, exec.signal)
       const outputDir = resolveOutputDir(request.outputDir, effective.outputDir)
-      await mkdir(outputDir, { recursive: true })
+      // One folder per session, so two sessions never interleave their images and
+      // a session's art stays findable without depending on its editable title.
+      const session = sessionFolderName(exec)
+      const targetDir = session === undefined ? outputDir : join(outputDir, 'sessions', session)
+      await mkdir(targetDir, { recursive: true })
       const stem = outputStem()
       const createdAt = new Date().toISOString()
       const images = []
@@ -1865,7 +1918,7 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
           : await downloadImage(entry, exec.signal)
         if (bytes.length === 0) throw new Error(`imagegen: image ${index + 1} decoded to zero bytes`)
         const { mimeType, extension } = sniffImageType(bytes)
-        const path = join(outputDir, `${stem}-${index + 1}${extension}`)
+        const path = join(targetDir, `${stem}-${index + 1}${extension}`)
         await writeFile(path, bytes)
         const attachment = await attachImage(ctx, effective, bytes, mimeType, path)
         images.push(attachment === undefined
@@ -1901,6 +1954,7 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
         // that call produced: the index has no per-call entity.
         ...usage === undefined ? {} : { usage },
         ...request.images.length === 0 ? {} : { inputImages: request.images },
+        ...session === undefined ? {} : { session },
         ...request.layout === undefined ? {} : { layout: request.layout },
         ...referenceRoles === undefined ? {} : { referenceRoles },
         ...request.prompt === callerPrompt ? {} : { promptSent: request.prompt },

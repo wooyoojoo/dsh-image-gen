@@ -22,6 +22,7 @@ import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadSharp, splitDshFlag } from './sharp.mjs'
 import { collectFrames, loadFrames, trimBox, resolveSchedule, describeSchedule, buildManifest } from './frames.mjs'
+import { placeOutput, publishAnimation } from './library.mjs'
 
 const { args, dshDir } = splitDshFlag(process.argv.slice(2))
 let out
@@ -33,10 +34,16 @@ let loop = 0
 let alphaThreshold = 128
 let trim = false
 let manifest
+let set
+let into
+let publish = false
 const positionals = []
 for (const value of args) {
   if (value.startsWith('--out=')) out = value.slice('--out='.length)
   else if (value.startsWith('--manifest=')) manifest = value.slice('--manifest='.length)
+  else if (value.startsWith('--set=')) set = value.slice('--set='.length)
+  else if (value.startsWith('--into=')) into = value.slice('--into='.length)
+  else if (value === '--publish') publish = true
   else if (value.startsWith('--delays=')) {
     delays = value.slice('--delays='.length).split(',').map(part => Number(part.trim()))
     if (delays.some(each => !Number.isInteger(each) || each < 0 || each > 65535)) throw new Error(`--delays must be whole 1/100s values in 0..65535, got ${JSON.stringify(value)}`)
@@ -49,11 +56,18 @@ for (const value of args) {
   else positionals.push(value)
 }
 if (out === undefined || positionals.length === 0) {
-  console.log('usage: node tools/make-gif.mjs --out=anim.gif [--delay=10 | --delays=16,9 | --exposures=4,2,6] [--scale=2] [--trim] [--loop=0] [--alpha=128] <frame.png ... | dir> [--dsh=<checkout>]')
+  console.log('usage: node tools/make-gif.mjs --out=anim.gif [--delay=10 | --delays=16,9 | --exposures=4,2,6] [--scale=2] [--trim] [--loop=0] [--alpha=128] [--set=<id> [--into=auto|<dir>] [--publish]] <frame.png ... | dir> [--dsh=<checkout>]')
   process.exit(2)
 }
+if (publish && set === undefined) throw new Error('--publish needs --set=<animation id>, which names the folder and the gallery record')
 
 const files = collectFrames(positionals)
+// A named animation belongs in the library, so the gallery lists it beside the stills.
+if (set !== undefined) {
+  out = await placeOutput({ out, set, into })
+  if (manifest !== undefined) manifest = await placeOutput({ out: manifest, set, into })
+  console.log(`LIBRARY ${out}`)
+}
 const sharp = await loadSharp(dshDir)
 const loaded = await loadFrames(sharp, files, scale)
 const { width, height } = loaded[0]
@@ -320,3 +334,19 @@ if (manifest !== undefined) {
 
 const check = await sharp(out, { animated: true }).metadata()
 console.log(`VERIFY format=${String(check.format)} ${String(check.width)}x${String(check.pageHeight)} pages=${String(check.pages)} (${String(check.pages) === String(frames.length) ? 'ok' : 'MISMATCH'})`)
+
+if (publish) {
+  const seconds = schedule.reduce((sum, each) => sum + each.num / each.den, 0)
+  const record = await publishAnimation({
+    file: out,
+    set,
+    frames: loaded.map(frame => frame.file),
+    exposures: Number((seconds * 24).toFixed(3)),
+    seconds: Number(seconds.toFixed(3)),
+    manifest,
+    prompt: `animation ${String(set)}: ${String(frames.length)} frames, ${seconds.toFixed(2)}s at a 24fps basis`,
+    into,
+    sharp,
+  })
+  console.log(`PUBLISHED ${record.id} -> ${record.path}`)
+}

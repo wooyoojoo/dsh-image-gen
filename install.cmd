@@ -234,7 +234,8 @@ if ($proxyUrl) {
 
 Write-Host ""
 Write-Host "完成。下一步：**重启 DSH**（改 index.js 必须重启才生效；cordis-plugin-hmr 是 disabled 的）。" -ForegroundColor Cyan
-Write-Host "重启后在**新会话**里，generate_image 就有 14 个参数（含 image/mask/background/output_format/seed/input_fidelity/extra/outputDir）。" -ForegroundColor Cyan
+Write-Host "重启后在**新会话**里，generate_image 就带上本版本的全部参数：image / mask / background / output_format / seed / input_fidelity / extra / outputDir，以及精灵图工作流用的 layout / animationSet / animationRole。" -ForegroundColor Cyan
+Write-Host "参数清单与实测结论以 README「工具参数」为准；精灵图与动画流程见 docs/on-twos.md。" -ForegroundColor Cyan
 if ($Ref -eq 'main') { Write-Host "提示：想要可复现，用 -Ref <sha> 固定版本（sha 见仓库提交历史）。" -ForegroundColor DarkGray }
 Pause-IfNeeded
 exit 0

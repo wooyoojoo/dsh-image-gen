@@ -183,13 +183,19 @@ check('n stays bounded', () => {
 
 console.log('sprite-sheet layouts and reference roles')
 check('a layout expands into the sheet rules without touching the caller prompt', () => {
-  const request = parseArgs({ prompt: 'a basin swing', layout: '3x2' }, config)
+  const request = parseArgs({ prompt: 'a basin swing', layout: '3x2', background: 'transparent' }, config)
   const composed = composePrompt(request)
   assert.equal(request.prompt, 'a basin swing')
   assert.match(composed, /exactly 6 frames in a 3-column by 2-row grid, read left to right/)
   assert.match(composed, /fully transparent background with no background fill, no grid lines/)
   assert.match(composed, /nothing crosses a cell boundary/)
   assert.equal(composed.startsWith('a basin swing\n\n'), true)
+})
+check('a layout over an opaque sheet fixes the scene instead of asking for alpha', () => {
+  const composed = composePrompt(parseArgs({ prompt: 'his hair lifts off', layout: '3x2' }, config))
+  assert.match(composed, /hold the framing, the camera angle and the scene identical in all the cells/)
+  assert.equal(/fully transparent/.test(composed), false)
+  assert.match(composed, /nothing crosses a cell boundary/)
 })
 check('a single-row layout warns about its narrow cells', () => {
   assert.match(layoutClause('6x1'), /Each cell is narrow/)
@@ -402,6 +408,27 @@ try {
     assert.equal(seen.length, before)
   })
 
+  await checkAsync('a session gets its own folder under the output root', async () => {
+    // The session title is editable, so isolation keys on the id instead.
+    const before = seen.length
+    const sessionExec = { signal: exec.signal, agent: { session: { id: 'session-abc123def456ghi' } } }
+    const result = await tool.execute({ prompt: 'a cat in a hat', outputDir: 'grouped' }, sessionExec)
+    assert.equal(seen.length, before + 1)
+    assert.match(result.images[0].path, /grouped[\\/]sessions[\\/]s-[a-z0-9]{12}[\\/]/)
+    const index = await readImageIndex(resolveStateDir())
+    assert.match(index[0].session, /^s-[a-z0-9]{12}$/)
+  })
+
+  await checkAsync('a call with no session attached writes straight into the named directory', async () => {
+    const before = seen.length
+    const result = await tool.execute({ prompt: 'a plain cat', outputDir: 'flat' }, exec)
+    assert.equal(seen.length, before + 1)
+    assert.match(result.images[0].path, /flat[\\/]image-/)
+    assert.equal(/sessions/.test(result.images[0].path), false)
+    const index = await readImageIndex(resolveStateDir())
+    assert.equal('session' in index[0], false)
+  })
+
   await checkAsync('an unreadable input image fails before any request', async () => {
     const before = seen.length
     await assert.rejects(
@@ -431,6 +458,15 @@ check('DSH_HOME decides the state directory, the home directory is the fallback'
   assert.equal(resolveStateDir({ DSH_HOME: 'C:/dsh' }, 'C:/users/x'), join('C:/dsh', STATE_DIR_NAME))
   assert.equal(resolveStateDir({}, 'C:/users/x'), join('C:/users/x', '.dsh', STATE_DIR_NAME))
   assert.equal(resolveStateDir({ DSH_HOME: '   ' }, 'C:/users/x'), join('C:/users/x', '.dsh', STATE_DIR_NAME))
+})
+check('the default output directory is the plugin state, not the launcher directory', () => {
+  const runtime = createRuntime(resolveConfig({}))
+  assert.equal(runtime.effective().outputDir, join(runtime.stateDir, 'output'))
+  // A configured directory still wins, and the page can override either.
+  assert.equal(createRuntime(resolveConfig({ outputDir: 'D:/art' })).effective().outputDir, 'D:/art')
+  const overridden = createRuntime(resolveConfig({}))
+  overridden.overrides = { outputDir: 'D:/picked' }
+  assert.equal(overridden.effective().outputDir, 'D:/picked')
 })
 check('sanitizing keeps only owned fields, with usable values', () => {
   assert.deepEqual(
@@ -784,6 +820,28 @@ try {
     // rewrite them could redirect every later generation.
     await assert.rejects(() => libraryTool.execute({ action: 'configure', field: 'apiKey', value: 'sk-x' }), /Plugins page/)
     await assert.rejects(() => libraryTool.execute({ action: 'configure', field: 'baseUrl', value: 'https://x.test' }), /Plugins page/)
+  })
+
+  await checkAsync('status says where each tunable comes from', async () => {
+    // One merged sentence for "profile value" and "built-in default" taught a user
+    // that a directory they never configured was their configuration.
+    const bare = await libraryTool.execute({ action: 'status' })
+    assert.equal(bare.status.sources.outputDir, 'config')
+    assert.equal(bare.status.fields.outputDir, toolDir)
+    await libraryTool.execute({ action: 'configure', field: 'outputDir', value: 'D:/picked' })
+    const overridden = await libraryTool.execute({ action: 'status' })
+    assert.equal(overridden.status.sources.outputDir, 'override')
+    assert.equal(overridden.status.fields.outputDir, 'D:/picked')
+    await libraryTool.execute({ action: 'configure', field: 'outputDir', value: null })
+    const restored = await libraryTool.execute({ action: 'status' })
+    assert.equal(restored.status.sources.outputDir, 'config')
+    assert.equal(restored.status.fields.outputDir, toolDir)
+    // With nothing configured anywhere, the source is the built-in default and the
+    // value is the plugin's own folder rather than wherever the process started.
+    const fresh = createRuntime(resolveConfig({}))
+    const status = await buildStatus(fakeCtx(fakeCredentialProvider()), resolveConfig({}), fresh)
+    assert.equal(status.sources.outputDir, 'default')
+    assert.equal(status.fields.outputDir, join(fresh.stateDir, 'output'))
   })
 
   await checkAsync('the tool configures a tunable through the write the page uses', async () => {

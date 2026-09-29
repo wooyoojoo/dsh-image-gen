@@ -52,7 +52,7 @@ node tools/frame-tool.mjs paste <sheet> <cols> <rows> <index> <frame> <out>
 ## slice.mjs —— 切片与归一化
 
 ```sh
-node tools/slice.mjs <sheet> <cols> <rows> <outDir> [--anchor=feet|box] [--canvas=640]
+node tools/slice.mjs <sheet> <cols> <rows> <outDir> [--cuts=gap|nominal] [--anchor=feet|box] [--canvas=640]
 ```
 
 产出的东西：`frame-<n>.png`、`contact-strip.png`（六帧并排，一眼验收）、`SLICE.txt`（刀口记录）。
@@ -60,9 +60,16 @@ node tools/slice.mjs <sheet> <cols> <rows> <outDir> [--anchor=feet|box] [--canva
 流程与取舍：
 
 1. 从 alpha 算出每列/每行的墨迹剖面；
-2. 每个标称分界线在 ±48px 窗口内，**优先取 ≥8px 真空隙的中点**；找不到真空隙就退化为"**窗口内墨迹最少的那一行/列**"，并把**切掉多少像素如实打印**（例如 `CUT y 1: nominal 512 -> 521 (least-ink fallback, splits 36px of artwork)`）——它不假装干净；
-3. 每帧 trim 到包围盒 → 判定**锚点** → 把锚点钉到画布固定位置 `(320, 608)`、不缩放（同一张图内部比例自洽，重采样只会引入模糊）；
+2. 每个标称分界线在 ±48px 窗口内，**优先取 ≥8px 真空隙的中点**；找不到真空隙就退化为"**窗口内墨迹最少的那一行/列**"（并列时选离标称最近的那条），并把**切掉多少像素如实打印**（例如 `CUT y 1: nominal 512 -> 521 (least-ink fallback, splits 36px of artwork)`）——它不假装干净；
+3. 每帧 trim 到包围盒 → 判定**锚点** → 把锚点钉到画布固定位置、不缩放（同一张图内部比例自洽，重采样只会引入模糊）；
 4. 装不下就**报错停下**，绝不静默裁切。
+
+**刀口模式**：
+
+| 模式 | 适用 | 行为 |
+|---|---|---|
+| `gap`（默认） | **抠好的角色表**（有透明背景） | 在标称线附近找空隙，找不到就用墨迹最少的线 |
+| `nominal` | **不透明场景表**（照片/背景填满格子） | 直接用标称栅格。这类表**每条线都是满墨**，找空隙没有意义 —— 实测还会因为并列最小而把栅格拖歪 48px |
 
 **锚点模式**（决定了动起来有没有"抽搐"）：
 
@@ -72,6 +79,8 @@ node tools/slice.mjs <sheet> <cols> <rows> <outDir> [--anchor=feet|box] [--canva
 | `box` | 整幅包围盒的底边与水平中心 | 道具甩出去会把人物一起拖走 |
 
 实测同一张六帧图：`box` 模式下脚底锚点在画布上散布 (258,607)…(298,607)，**x 抖动 56px**（约为角色宽度的 9%，头会跟着晃）；`feet` 模式下六帧全部落在 `(320,608)`，是构造上归零。脚本会打印每帧的锚点与跨帧抖动，`SLICE.txt` 也记录一份。
+
+**场景表要点**：`--cuts=nominal --anchor=box`，并且因为切片器强制 32px 边距，画布要开到"格子尺寸 + 64"（512 格 → `--canvas=576`）；后面拼动图时用 `--trim` 把那圈透明边裁掉即可。`feet` 锚点假设的是"抠好的立绘 + 地面接触点"，整格都是墨迹时它会算错。
 
 ## make-gif.mjs —— 拼动图（自带 GIF 编码器）
 
@@ -157,6 +166,44 @@ node tools/normalize.mjs <frame> --to=<邻居帧.png>[,...] [--feature=face|silh
 **为什么要选对特征**：默认用 `--feature=face`，即**最大的肤色连通域（脸）**。它对手臂、道具、拖影都免疫；而任何剪影类指标在 smear 帧上都会失真 —— 实测 smear 的头发被速度拖到 897px 宽，而同序列只有 335px，指标量的是"拖影"不是"角色"。`--feature=silhouette` 用艺术高度，只在**姿态与参考完全一致**时才安全。
 
 工具会打印双方的测量值、参考中位数与得到的系数；`--out=` 才真正写出缩放后的帧。**数值只能保证量级，务必再拼条带与邻居对比一眼**。实测复现：impact 帧对命中帧 → `x0.6672`。
+
+## library.mjs —— 资源归档与画廊登记
+
+```sh
+node tools/make-gif.mjs  --out=anim.gif --set=hair-ascend --publish frames/
+node tools/make-apng.mjs --out=anim.png --set=hair-ascend --publish --manifest=exposure.json frames/
+```
+
+**解决的问题**：画廊只列插件索引（`$DSH_HOME/imagegen/images.json`）里的记录，而 `tools/` 产出的文件不会自己进索引 —— 于是动图既不出现在画廊里，位置也跟静态图天各一方。
+
+带 `--set=<集名>` 时，输出落到资源根下的 `animations/<集名>/`；`--publish` 再把帧复制进去，并**追加一条画廊记录**（`mode: "animation"`、`animationId`、帧数、总格数、时长、清单路径）：
+
+```
+<资源根>/animations/hair-ascend/
+   hair-ascend.gif            1.7 MB
+   hair-ascend.apng.png       4.6 MB
+   hair-ascend.exposure.json  交付清单
+   frames/frame-01..12.png    帧，随动画一起归档
+```
+
+**资源根怎么定**（`--into=auto`，默认）：**优先用配置里的 `outputDir`**（插件页填的那个），其次跟随**最新一条静态图**记录所在目录 —— 并在回退时**剥掉 `sessions/<id>` 一层**，这样动画永远不会嵌进某个会话的目录里；最后才是当前目录。`auto` 也**不跟随已发布的动画**（否则会一层层套进自己的子目录）。
+
+**放哪儿最稳**：画廊的图片路由是普通读文件，**没有工作区边界**，所以资源根可以放在检出目录之外（例如 `D:\dsh-art`），静态图与动画就都不会随重拉仓库消失。插件那边还会在每个资源根下按会话隔离一层：`sessions/s-<会话 id 后 12 位>/`。
+
+## relocate.mjs —— 把散落的资源搬进统一根
+
+```sh
+node tools/relocate.mjs --dry-run      # 先看计划
+node tools/relocate.mjs                # 真搬
+```
+
+配置资源根之前生成的图，落在"当时从哪个目录启动"的地方，于是一个人的图会散在好几处（实测 6 处：检出、桌面、`~/.dsh/imagegen-output`……）。这个脚本把它们搬进统一根并**改写索引**：
+
+- 属于已发布动画的文件保留 `animations/<集名>/` 结构；
+- 其余进 `legacy/<原目录名>/`，**保留来源**（`legacy\desktop\`、`legacy\.artifacts\`…）；
+- 逐文件**复制 → 校验尺寸 → 再删源**，跨盘也安全；**每条记录搬完就回写索引**，中断不会留下指向空文件的记录。
+
+实测：43 条记录 / 55 个文件 / 68 MB 落到 `D:\dsh-art`，0 条残留。
 
 ## 一次典型流程
 

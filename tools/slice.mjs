@@ -31,18 +31,21 @@ import { loadSharp, splitDshFlag } from './sharp.mjs'
 const { args: rawArgs, dshDir } = splitDshFlag(process.argv.slice(2))
 let anchor = 'feet'
 let canvas = 640
+let cuts = 'gap'
 const args = []
 for (const value of rawArgs) {
   if (value.startsWith('--anchor=')) anchor = value.slice('--anchor='.length)
   else if (value.startsWith('--canvas=')) canvas = Number(value.slice('--canvas='.length))
+  else if (value.startsWith('--cuts=')) cuts = value.slice('--cuts='.length)
   else args.push(value)
 }
 const [sheetPath, colsArg, rowsArg, outDir] = args
 if (outDir === undefined) {
-  console.log('usage: node tools/slice.mjs <sheet> <cols> <rows> <outDir> [--anchor=feet|box] [--canvas=640] [--dsh=<checkout>]')
+  console.log('usage: node tools/slice.mjs <sheet> <cols> <rows> <outDir> [--anchor=feet|box] [--cuts=gap|nominal] [--canvas=640] [--dsh=<checkout>]')
   process.exit(2)
 }
 if (anchor !== 'feet' && anchor !== 'box') throw new Error(`unknown anchor ${JSON.stringify(anchor)}: use feet or box`)
+if (cuts !== 'gap' && cuts !== 'nominal') throw new Error(`unknown cuts ${JSON.stringify(cuts)}: use gap or nominal`)
 const sharp = await loadSharp(dshDir)
 const COLS = Number(colsArg)
 const ROWS = Number(rowsArg)
@@ -68,7 +71,7 @@ for (let y = 0; y < H; y += 1) {
   }
 }
 
-/** Prefer the middle of a wide empty run; otherwise the least-ink line. */
+/** Prefer the middle of a wide empty run; otherwise the least-ink line nearest the boundary. */
 function findCut(profile, nominal) {
   const lo = Math.max(1, nominal - WINDOW)
   const hi = Math.min(profile.length - 2, nominal + WINDOW)
@@ -86,9 +89,17 @@ function findCut(profile, nominal) {
     runStart = null
   }
   if (best !== null && best.len >= MIN_RUN) return { cut: best.cut, ink: 0, how: `empty gutter of ${String(best.len)}px` }
+  // An opaque sheet inks every line, so several candidates tie at the same count:
+  // the nominal boundary wins those ties, and the window never drags the grid.
   let least = null
   for (let i = lo; i <= hi; i += 1) {
-    if (least === null || profile[i] < least.ink) least = { cut: i, ink: profile[i] }
+    if (least === null || profile[i] < least.ink) {
+      least = { cut: i, ink: profile[i] }
+      continue
+    }
+    if (profile[i] === least.ink && Math.abs(i - nominal) < Math.abs(least.cut - nominal)) {
+      least = { cut: i, ink: profile[i] }
+    }
   }
   return { cut: least.cut, ink: least.ink, how: 'least-ink fallback' }
 }
@@ -98,12 +109,12 @@ const cellH = Math.floor(H / ROWS)
 const xs = [0]
 const ys = [0]
 for (let c = 1; c < COLS; c += 1) {
-  const found = findCut(colInk, c * cellW)
+  const found = cuts === 'nominal' ? { cut: c * cellW, ink: colInk[c * cellW], how: 'nominal grid' } : findCut(colInk, c * cellW)
   xs.push(found.cut)
   console.log(`CUT x ${String(c)}: nominal ${String(c * cellW)} -> ${String(found.cut)} (${found.how}, splits ${String(found.ink)}px of artwork)`)
 }
 for (let r = 1; r < ROWS; r += 1) {
-  const found = findCut(rowInk, r * cellH)
+  const found = cuts === 'nominal' ? { cut: r * cellH, ink: rowInk[r * cellH], how: 'nominal grid' } : findCut(rowInk, r * cellH)
   ys.push(found.cut)
   console.log(`CUT y ${String(r)}: nominal ${String(r * cellH)} -> ${String(found.cut)} (${found.how}, splits ${String(found.ink)}px of artwork)`)
 }

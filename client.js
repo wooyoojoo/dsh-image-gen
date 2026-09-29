@@ -243,6 +243,8 @@ window.__ModuleLoader__.load({
       'config.readOnlyFrom': '来源：{where}，只读',
       'config.overridden': '已在插件页覆盖，清空并保存即恢复默认',
       'config.inherited': '来自 profile 配置或内置默认值',
+      'config.fromProfileConfig': '来自 profile 配置（可在此覆盖）',
+      'config.fromDefault': '内置默认值（profile 与本页都没配）',
       'config.baseUrlPlaceholder': 'https://relay.example.com/v1',
       'config.keyConfigured': '已保存（留空表示不修改）',
       'config.keyMissing': '未配置',
@@ -311,6 +313,8 @@ window.__ModuleLoader__.load({
       'config.readOnlyFrom': 'From {where}; read-only',
       'config.overridden': 'Overridden on this page; save an empty value to fall back',
       'config.inherited': 'From the profile configuration or the built-in default',
+      'config.fromProfileConfig': 'From the profile configuration (overridable here)',
+      'config.fromDefault': 'Built-in default (set neither in the profile nor on this page)',
       'config.baseUrlPlaceholder': 'https://relay.example.com/v1',
       'config.keyConfigured': 'Saved (leave blank to keep it)',
       'config.keyMissing': 'Not configured',
@@ -753,7 +757,14 @@ window.__ModuleLoader__.load({
 
       const overrideNotes = {}
       for (const field of FIELD_ORDER) {
-        overrideNotes[field] = status.overrides[field] === undefined ? t('config.inherited') : t('config.overridden')
+        const source = status.sources === undefined
+          ? (status.overrides[field] === undefined ? 'unknown' : 'override')
+          : status.sources[field]
+        overrideNotes[field] = source === 'override'
+          ? t('config.overridden')
+          : source === 'config'
+            ? t('config.fromProfileConfig')
+            : source === 'default' ? t('config.fromDefault') : t('config.inherited')
       }
 
       return h('div', { style: S.stack },
