@@ -33,9 +33,11 @@ import {
   buildGenerationBody,
   buildRoutes,
   buildStatus,
+  composePrompt,
   createRuntime,
   defineGenerateImage,
   defineImageLibrary,
+  layoutClause,
   MAX_INPUT_IMAGES,
   MAX_PAGE_SIZE,
   modelsUrl,
@@ -179,6 +181,45 @@ check('n stays bounded', () => {
   assert.throws(() => parseArgs({ prompt: 'x', n: 5 }, config), /n must be an integer/)
 })
 
+console.log('sprite-sheet layouts and reference roles')
+check('a layout expands into the sheet rules without touching the caller prompt', () => {
+  const request = parseArgs({ prompt: 'a basin swing', layout: '3x2' }, config)
+  const composed = composePrompt(request)
+  assert.equal(request.prompt, 'a basin swing')
+  assert.match(composed, /exactly 6 frames in a 3-column by 2-row grid, read left to right/)
+  assert.match(composed, /fully transparent background with no background fill, no grid lines/)
+  assert.match(composed, /nothing crosses a cell boundary/)
+  assert.equal(composed.startsWith('a basin swing\n\n'), true)
+})
+check('a single-row layout warns about its narrow cells', () => {
+  assert.match(layoutClause('6x1'), /Each cell is narrow/)
+  assert.equal(/Each cell is narrow/.test(layoutClause('3x2')), false)
+})
+check('an unknown layout is rejected', () => {
+  assert.throws(() => parseArgs({ prompt: 'x', layout: '5x5' }, config), /layout must be one of 2x2, 3x2, 4x2, 2x3, 6x1/)
+})
+check('an image entry may declare what its reference is for', () => {
+  const request = parseArgs({ prompt: 'x', image: [{ path: 'a.png', role: 'camera' }, 'b.png'] }, config)
+  assert.deepEqual(request.images, ['a.png', 'b.png'])
+  assert.deepEqual(request.imageRoles, ['camera', undefined])
+  const composed = composePrompt(request)
+  assert.match(composed, /Reference images, in order: 1\) camera angle only/)
+  assert.match(composed, /2\) an additional reference/)
+})
+check('references without a declared role leave the prompt alone', () => {
+  assert.equal(composePrompt(parseArgs({ prompt: 'x', image: 'a.png' }, config)), 'x')
+})
+check('an unusable image entry or role is rejected', () => {
+  assert.throws(() => parseArgs({ prompt: 'x', image: [{ path: 'a.png', role: 'prop' }] }, config), /image role must be one of/)
+  assert.throws(() => parseArgs({ prompt: 'x', image: [{ role: 'camera' }] }, config), /needs a non-empty path/)
+  assert.throws(() => parseArgs({ prompt: 'x', image: [{ path: 'a.png', weight: 2 }] }, config), /unknown image field\(s\) weight/)
+})
+check('an animation role needs its set, and a set needs its role', () => {
+  assert.throws(() => parseArgs({ prompt: 'x', animationRole: 'key' }, config), /needs animationSet/)
+  assert.throws(() => parseArgs({ prompt: 'x', animationSet: 'smash' }, config), /needs animationRole/)
+  assert.throws(() => parseArgs({ prompt: 'x', animationSet: 'smash', animationRole: 'boss' }, config), /animationRole must be one of key, frame, smear, vfx/)
+})
+
 console.log('request bodies')
 check('generations body: explicit fields win and absent fields are omitted', () => {
   const request = parseArgs(
@@ -310,6 +351,55 @@ try {
     assert.equal(newest.name.endsWith('.png'), true)
     assert.deepEqual(newest.inputImages, [inputImage])
     assert.equal(index[1].mode, 'generations')
+  })
+
+  await checkAsync('a layout call sends the sheet rules and records the structure', async () => {
+    const before = seen.length
+    await tool.execute({ prompt: 'a basin swing', layout: '3x2', background: 'transparent', output_format: 'png' }, exec)
+    assert.equal(seen.length, before + 1)
+    const body = JSON.parse(seen[before].raw.toString('utf8'))
+    assert.match(body.prompt, /^a basin swing\n\nSprite-sheet layout: exactly 6 frames/)
+    const index = await readImageIndex(resolveStateDir())
+    assert.equal(index[0].layout, '3x2')
+    // The caller's own words stay in `prompt`; the composed text is kept apart.
+    assert.equal(index[0].prompt, 'a basin swing')
+    assert.match(index[0].promptSent, /Sprite-sheet layout/)
+  })
+
+  await checkAsync('an animation set locks its key frame and anchors later frames to it', async () => {
+    const before = seen.length
+    const key = await tool.execute({ prompt: 'idle stance', animationSet: 'smash', animationRole: 'key' }, exec)
+    const frame = await tool.execute({ prompt: 'overhead wind-up', animationSet: 'smash', animationRole: 'frame' }, exec)
+    assert.equal(seen.length, before + 2)
+    // A key frame is a plain generation; the follow-up frame becomes an edit that
+    // carries the key frame as its first reference.
+    assert.equal(seen[before].url, '/v1/images/generations')
+    assert.equal(seen[before + 1].url, '/v1/images/edits')
+    assert.deepEqual(frame.inputImages, [key.images[0].path])
+    assert.match(seen[before + 1].raw.toString('latin1'), /key frame of this animation/)
+    assert.match(seen[before + 1].raw.toString('latin1'), /name="image"/)
+    const index = await readImageIndex(resolveStateDir())
+    assert.equal(index[0].animationId, 'smash')
+    assert.equal(index[0].animationRole, 'frame')
+    assert.equal(index[0].frameIndex, 0)
+    assert.deepEqual(index[0].referenceRoles, ['key'])
+    assert.equal(index[1].animationRole, 'key')
+    assert.equal(index[1].frameIndex, 0)
+    const sets = JSON.parse(await readFile(join(resolveStateDir(), 'animations.json'), 'utf8'))
+    assert.equal(sets.sets.smash.key.path, key.images[0].path)
+    assert.equal(sets.sets.smash.frames.length, 1)
+    assert.equal(sets.sets.smash.frames[0].role, 'frame')
+    assert.equal(sets.sets.smash.frames[0].index, 0)
+    assert.equal(sets.sets.smash.frames[0].path, frame.images[0].path)
+  })
+
+  await checkAsync('a frame of an unknown animation set fails before any request', async () => {
+    const before = seen.length
+    await assert.rejects(
+      () => tool.execute({ prompt: 'x', animationSet: 'nope', animationRole: 'frame' }, exec),
+      /unknown animation set "nope"/,
+    )
+    assert.equal(seen.length, before)
   })
 
   await checkAsync('an unreadable input image fails before any request', async () => {

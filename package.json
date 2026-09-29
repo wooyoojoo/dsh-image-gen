@@ -1,6 +1,6 @@
 {
   "name": "dsh-imagegen",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "generate_image and image_library: OpenAI-compatible image generation and editing for DeepSeek Harness, with a Plugins-page gallery and settings.",
   "type": "module",

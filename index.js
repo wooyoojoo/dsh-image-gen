@@ -85,6 +85,38 @@ export const MAX_IMAGES = 4
  */
 export const MAX_INPUT_IMAGES = 8
 
+/**
+ * Sprite-sheet layouts the `layout` argument accepts, as column and row counts.
+ * Only shapes measured to survive slicing are listed: a cell narrower than about
+ * 400px cannot hold a chibi character and its prop without crossing the cell
+ * boundary, so the single-row shapes are the awkward ones.
+ */
+export const LAYOUTS = {
+  '2x2': { cols: 2, rows: 2 },
+  '3x2': { cols: 3, rows: 2 },
+  '4x2': { cols: 4, rows: 2 },
+  '2x3': { cols: 2, rows: 3 },
+  '6x1': { cols: 6, rows: 1 },
+}
+
+/**
+ * Roles an `image` entry may declare, each contributing one clause to the
+ * composed prompt. What a reference is *for* decides what may be taken from it:
+ * an undeclared camera reference bleeds its art style into the result.
+ */
+export const IMAGE_ROLES = {
+  character: 'the character: copy her design exactly — hairstyle, outfit, colours and proportions',
+  key: 'the locked key frame of this animation: match its camera angle, proportions, rendering style and framing, but do not copy its pose',
+  camera: 'camera angle only: copy nothing else from it — no characters, rendering style, palette, scenery or background',
+  proportions: 'head-to-body proportions only: never its pose or framing',
+  pose: 'this exact pose, camera angle and framing',
+  style: 'the art style only: match its line weight, shading and palette',
+  reference: 'an additional reference',
+}
+
+/** Roles a call may claim inside an animation set. */
+export const ANIMATION_ROLES = ['key', 'frame', 'smear', 'vfx']
+
 /** Request kinds, each with its own endpoint and body encoding. */
 export const KIND_GENERATIONS = 'generations'
 export const KIND_EDITS = 'edits'
@@ -111,6 +143,9 @@ export const OVERRIDES_FILE = 'config.json'
 
 /** File holding one record per generated image. */
 export const INDEX_FILE = 'images.json'
+
+/** File holding the animation sets: one locked key frame per set, plus the frames derived from it. */
+export const ANIMATIONS_FILE = 'animations.json'
 
 /** Newest records the index keeps; older files stay on disk, unlisted. */
 export const MAX_INDEX_RECORDS = 500
@@ -347,23 +382,97 @@ function isPlainObject(value) {
 }
 
 /**
- * Normalize `image` (one path or several) into a bounded list of paths.
+ * Normalize `image` (paths, role objects, or a mix) into two parallel lists.
  *
  * @param value - the raw `image` argument, if any.
- * @returns The input image paths.
- * @throws When the list is empty, too long, or holds a non-string entry.
+ * @returns The input image paths, and each entry's declared role (`undefined` when it declared none).
+ * @throws When the list is empty, too long, or holds an unusable entry.
  */
-function normalizeImages(value) {
-  if (value === undefined) return []
+export function normalizeImageEntries(value) {
+  if (value === undefined) return { paths: [], roles: [] }
   const list = Array.isArray(value) ? value : [value]
   if (list.length === 0) throw new Error('imagegen: image must name at least one file')
   if (list.length > MAX_INPUT_IMAGES) {
     throw new Error(`imagegen: at most ${MAX_INPUT_IMAGES} input images are supported, got ${list.length}`)
   }
+  const paths = []
+  const roles = []
   for (const entry of list) {
-    if (!isFilledString(entry)) throw new Error('imagegen: every image entry must be a non-empty path string')
+    if (isFilledString(entry)) {
+      paths.push(entry.trim())
+      roles.push(undefined)
+      continue
+    }
+    if (!isPlainObject(entry)) {
+      throw new Error('imagegen: every image entry must be a path string or an object holding a path and an optional role')
+    }
+    if (!isFilledString(entry.path)) throw new Error('imagegen: an image object needs a non-empty path')
+    const unknown = Object.keys(entry).filter(key => key !== 'path' && key !== 'role')
+    if (unknown.length > 0) throw new Error(`imagegen: unknown image field(s) ${unknown.join(', ')}`)
+    if (entry.role !== undefined && IMAGE_ROLES[entry.role] === undefined) {
+      throw new Error(`imagegen: image role must be one of ${Object.keys(IMAGE_ROLES).join(', ')}`)
+    }
+    paths.push(entry.path.trim())
+    roles.push(entry.role)
   }
-  return list.map(entry => entry.trim())
+  return { paths, roles }
+}
+
+/**
+ * The clause a sprite-sheet layout contributes: the grid, the reading order, and
+ * the constraints that make the result sliceable.
+ *
+ * Two measured facts are baked in: the model scales artwork to fill each cell,
+ * so margins must be added in post rather than requested; and a cell narrower
+ * than roughly 400px lets a swung prop cross into its neighbour.
+ *
+ * @param layout - a key of {@link LAYOUTS}.
+ * @returns The clause to append to the prompt.
+ * @throws When the layout is unknown.
+ */
+export function layoutClause(layout) {
+  const spec = LAYOUTS[layout]
+  if (spec === undefined) {
+    throw new Error(`imagegen: layout must be one of ${Object.keys(LAYOUTS).join(', ')}, got ${JSON.stringify(layout)}`)
+  }
+  const lines = [
+    `Sprite-sheet layout: exactly ${spec.cols * spec.rows} frames in a ${spec.cols}-column by ${spec.rows}-row grid, read left to right and top row first; every frame is a distinct step of the motion.`,
+    'Only the artwork is opaque: fully transparent background with no background fill, no grid lines, no cell borders, no dividers and no frames around the cells.',
+    'Keep every frame inside its own cell with a margin, so nothing crosses a cell boundary; natural proportions, centred in the cell, never stretched to fill it.',
+    'No text, no numbers, no captions, no watermark, no logo, and no motion blur unless the prompt asks for it.',
+  ]
+  if (spec.cols >= 5) {
+    lines.push('Each cell is narrow: keep the character at its natural size rather than stretching it, and keep the arms and props close to the body so they stay inside the cell.')
+  }
+  return lines.join(' ')
+}
+
+/**
+ * The clause naming what each reference image is for.
+ *
+ * @param roles - one entry per image, a key of {@link IMAGE_ROLES} or `undefined`.
+ * @returns The clause, or `undefined` when no entry declared a role.
+ */
+export function referenceClause(roles) {
+  if (!roles.some(role => role !== undefined)) return undefined
+  const described = roles.map((role, index) => `${index + 1}) ${role === undefined ? IMAGE_ROLES.reference : IMAGE_ROLES[role]}`)
+  return `Reference images, in order: ${described.join('; ')}.`
+}
+
+/**
+ * Compose the prompt actually sent: the caller's text plus the clauses the named
+ * layout and reference roles contribute, so the rules that make a sheet usable
+ * need not be restated on every call.
+ *
+ * @param request - validated request fields.
+ * @returns The prompt handed to the provider.
+ */
+export function composePrompt(request) {
+  const parts = [request.prompt]
+  if (request.layout !== undefined) parts.push(layoutClause(request.layout))
+  const clause = referenceClause(request.imageRoles ?? [])
+  if (clause !== undefined) parts.push(clause)
+  return parts.join('\n\n')
 }
 
 /**
@@ -384,6 +493,7 @@ export function parseArgs(args, config) {
     'prompt', 'model', 'size', 'quality', 'n',
     'image', 'mask', 'background', 'output_format', 'seed', 'input_fidelity',
     'extra', 'providerOptions', 'outputDir',
+    'layout', 'animationSet', 'animationRole',
   ]
   const unknown = Object.keys(args).filter(key => !known.includes(key))
   if (unknown.length > 0) throw new Error(`imagegen: unknown argument(s) ${unknown.join(', ')}`)
@@ -405,7 +515,22 @@ export function parseArgs(args, config) {
   if (args.seed !== undefined && !(Number.isInteger(args.seed) || isFilledString(args.seed))) {
     throw new Error('imagegen: seed must be an integer or a string when set')
   }
-  const images = normalizeImages(args.image)
+  if (args.layout !== undefined && LAYOUTS[args.layout] === undefined) {
+    throw new Error(`imagegen: layout must be one of ${Object.keys(LAYOUTS).join(', ')}`)
+  }
+  if (args.animationSet !== undefined && !isFilledString(args.animationSet)) {
+    throw new Error('imagegen: animationSet must be a non-empty string when set')
+  }
+  if (args.animationRole !== undefined && !ANIMATION_ROLES.includes(args.animationRole)) {
+    throw new Error(`imagegen: animationRole must be one of ${ANIMATION_ROLES.join(', ')}`)
+  }
+  if (args.animationRole !== undefined && args.animationSet === undefined) {
+    throw new Error('imagegen: animationRole needs animationSet, which names the set it belongs to')
+  }
+  if (args.animationSet !== undefined && args.animationRole === undefined) {
+    throw new Error('imagegen: animationSet needs animationRole: one of ' + ANIMATION_ROLES.join(', '))
+  }
+  const { paths: images, roles: imageRoles } = normalizeImageEntries(args.image)
   if (images.length === 0 && args.mask !== undefined) {
     throw new Error('imagegen: mask needs at least one image')
   }
@@ -421,6 +546,7 @@ export function parseArgs(args, config) {
     size: args.size ?? config.size,
     quality: args.quality ?? config.quality,
     images,
+    imageRoles,
     mask: args.mask,
     background,
     outputFormat,
@@ -428,6 +554,9 @@ export function parseArgs(args, config) {
     inputFidelity: args.input_fidelity,
     extra: { ...args.providerOptions, ...args.extra },
     outputDir: args.outputDir,
+    layout: args.layout,
+    animationSet: args.animationSet,
+    animationRole: args.animationRole,
   }
 }
 
@@ -928,6 +1057,117 @@ export function recordGeneratedImages(stateDir, records) {
   // The queue tail stays fulfilled so one failed write cannot strand later ones.
   indexWrites = write.then(() => undefined, () => undefined)
   return write
+}
+
+/* ------------------------------------------------------------------ *
+ * Animation sets: one locked key frame per set, plus the frames derived from it.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Read the animation sets.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @returns The sets by id; an absent file reads as none.
+ * @throws When the file exists but cannot be read, or is not valid JSON.
+ */
+export async function readAnimationSets(stateDir) {
+  let text
+  try {
+    text = await readFile(join(stateDir, ANIMATIONS_FILE), 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT') return {}
+    throw error
+  }
+  const parsed = JSON.parse(text)
+  const sets = isPlainObject(parsed) ? parsed.sets : undefined
+  return isPlainObject(sets) ? sets : {}
+}
+
+/**
+ * Replace the animation sets.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param sets - every set to keep, by id.
+ */
+export async function writeAnimationSets(stateDir, sets) {
+  await writeFileAtomic(join(stateDir, ANIMATIONS_FILE), `${JSON.stringify({ version: 1, sets }, null, 2)}\n`)
+}
+
+/** Serializes set writes on the same terms as the image index. */
+let animationWrites = Promise.resolve()
+
+/**
+ * Record one call's membership in its animation set.
+ *
+ * The first `key` call claims the set's key frame; every other role appends a
+ * numbered frame, which is the order an exposure sheet plays them in.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param setId - the set the call belongs to.
+ * @param role - the role this call claimed.
+ * @param records - the records this call produced, in order.
+ * @returns Settlement after the set holds them.
+ */
+export function recordAnimation(stateDir, setId, role, records) {
+  const write = animationWrites.then(async () => {
+    const sets = await readAnimationSets(stateDir)
+    const set = sets[setId] ?? { id: setId, createdAt: new Date().toISOString(), frames: [] }
+    for (const record of records) {
+      if (role === 'key' && set.key === undefined) {
+        set.key = { recordId: record.id, path: record.path }
+        continue
+      }
+      set.frames.push({ recordId: record.id, path: record.path, role, index: set.frames.length })
+    }
+    sets[setId] = set
+    await writeAnimationSets(stateDir, sets)
+  })
+  animationWrites = write.then(() => undefined, () => undefined)
+  return write
+}
+
+/**
+ * Attach a set's locked key frame as the first reference of a follow-up call, so
+ * every frame of one animation inherits the key frame's character, camera and
+ * style without the caller restating any of it.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param request - validated request fields; its image lists are replaced in place.
+ * @returns The attached key frame path, or `undefined` when nothing was attached.
+ * @throws When the set is unknown, has no key frame yet, or is already at the input-image bound.
+ */
+export async function attachAnimationKey(stateDir, request) {
+  if (request.animationSet === undefined || request.animationRole === 'key') return undefined
+  const sets = await readAnimationSets(stateDir)
+  const set = sets[request.animationSet]
+  if (set === undefined) {
+    throw new Error(`imagegen: unknown animation set ${JSON.stringify(request.animationSet)} — generate its key frame first with animationRole "key"`)
+  }
+  if (!isPlainObject(set.key) || !isFilledString(set.key.path)) {
+    throw new Error(`imagegen: animation set ${JSON.stringify(request.animationSet)} has no key frame yet`)
+  }
+  if (request.images.includes(set.key.path)) return undefined
+  if (request.images.length >= MAX_INPUT_IMAGES) {
+    throw new Error(`imagegen: attaching the key frame of ${JSON.stringify(request.animationSet)} would exceed ${MAX_INPUT_IMAGES} input images`)
+  }
+  request.images = [set.key.path, ...request.images]
+  request.imageRoles = ['key', ...(request.imageRoles ?? [])]
+  return set.key.path
+}
+
+/**
+ * The index a call takes inside its set: 0 for a key frame, else the next slot.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param request - validated request fields.
+ * @returns The frame index, or `undefined` when the call names no set.
+ */
+export async function nextFrameIndex(stateDir, request) {
+  if (request.animationSet === undefined) return undefined
+  if (request.animationRole === 'key') return 0
+  const sets = await readAnimationSets(stateDir)
+  const set = sets[request.animationSet]
+  return isPlainObject(set) && Array.isArray(set.frames) ? set.frames.length : 1
 }
 
 /* ------------------------------------------------------------------ *
@@ -1479,7 +1719,8 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
     description: 'Generate or edit one or more images with a third-party image model, and save them as files. '
       + 'Each generated image is attached to this result, so you can see what was drawn without reading the file back; when an image does not reach you, read its saved path with read_image. '
       + 'Pass `image` (a local path, or several) to keep an existing picture and change only what the prompt asks for — that switches the call to the provider\'s edit endpoint. '
-      + '`mask`, `background`, `output_format`, `seed`, and `input_fidelity` are passed through when the provider understands them, and any other provider field goes into `extra`.',
+      + '`mask`, `background`, `output_format`, `seed`, and `input_fidelity` are passed through when the provider understands them, and any other provider field goes into `extra`. '
+      + 'For animation work, `layout` asks for a sprite sheet and appends the rules that make it sliceable, while `animationSet`/`animationRole` group successive frames under one locked key frame that each later frame is anchored to.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1495,8 +1736,23 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
         n: { type: 'integer', description: `How many images to generate, 1 to ${MAX_IMAGES}. Defaults to 1.` },
         image: {
           type: 'array',
-          items: { type: 'string' },
-          description: 'Local path(s) of the image(s) to edit. A bare path string is also accepted. '
+          items: {
+            anyOf: [
+              { type: 'string' },
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  path: { type: 'string' },
+                  role: { type: 'string', description: `What this reference is for: ${Object.keys(IMAGE_ROLES).join(', ')}.` },
+                },
+                required: ['path'],
+              },
+            ],
+          },
+          description: 'Local path(s) of the image(s) to edit; a bare path string is also accepted. '
+            + 'An entry may be `{ path, role }`, and the plugin then states in the prompt what each reference is for — '
+            + 'an undeclared camera reference bleeds its art style into the result. '
             + 'Giving any image switches the call to the edits endpoint (multipart upload).',
         },
         mask: {
@@ -1523,6 +1779,22 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
         outputDir: {
           type: 'string',
           description: 'Directory for the saved files. Defaults to the configured outputDir; a relative path resolves against it.',
+        },
+        layout: {
+          type: 'string',
+          description: `Sprite-sheet layout: ${Object.keys(LAYOUTS).join(', ')}. `
+            + 'The plugin appends the grid, reading order, transparency and no-bleed clauses to the prompt, '
+            + 'so a sliceable sheet does not require restating those rules on every call.',
+        },
+        animationSet: {
+          type: 'string',
+          description: 'Name of the animation set this image belongs to. The first call claims the set with animationRole "key"; '
+            + 'every later call of the same set is anchored to that key frame automatically, as its first reference image.',
+        },
+        animationRole: {
+          type: 'string',
+          description: 'Role inside the set: key (the locked key frame), frame (a step of the motion), '
+            + 'smear (a motion-blur in-between), vfx (an effect or hit asset). Needs animationSet.',
         },
       },
       required: ['prompt'],
@@ -1573,6 +1845,12 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
       runtime.overrides = await refreshOverrides(ctx, runtime)
       const effective = runtime.effective()
       const request = parseArgs(args, effective)
+      // A follow-up frame inherits the set's locked key frame as its first
+      // reference, and the caller's own prompt is what the index records.
+      await attachAnimationKey(runtime.stateDir, request)
+      const frameIndex = await nextFrameIndex(runtime.stateDir, request)
+      const callerPrompt = request.prompt
+      request.prompt = composePrompt(request)
       const kind = requestKind(request)
       const { endpoint, apiKey } = await resolveTarget(ctx, effective, kind)
       const { entries, revisedPrompt, usage } = await requestImages(endpoint, apiKey, request, effective.timeoutMs, exec.signal)
@@ -1597,16 +1875,21 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
       const result = { model: request.model, mode: kind, images }
       if (request.images.length > 0) result.inputImages = request.images
       if (revisedPrompt !== undefined) result.revisedPrompt = revisedPrompt
+      // A layout and reference roles are structure rather than prose: keeping them
+      // out of `prompt` leaves the index readable and the composition reproducible.
+      const referenceRoles = request.imageRoles.some(role => role !== undefined)
+        ? request.imageRoles.map(role => role ?? null)
+        : undefined
       // Bookkeeping only: the files are saved and the result stands, so a failed
       // index write must not fail a generation that already succeeded.
-      await recordGeneratedImages(runtime.stateDir, images.map((image, index) => ({
+      const records = images.map((image, index) => ({
         id: `${stem}-${index + 1}`,
         createdAt,
         path: image.path,
         name: basename(image.path),
         mimeType: image.mimeType,
         bytes: image.bytes,
-        prompt: request.prompt,
+        prompt: callerPrompt,
         model: request.model,
         size: request.size,
         mode: kind,
@@ -1618,7 +1901,15 @@ export function defineGenerateImage(ctx, config, runtime = createRuntime(config)
         // that call produced: the index has no per-call entity.
         ...usage === undefined ? {} : { usage },
         ...request.images.length === 0 ? {} : { inputImages: request.images },
-      }))).catch((error) => { warn(ctx, error) })
+        ...request.layout === undefined ? {} : { layout: request.layout },
+        ...referenceRoles === undefined ? {} : { referenceRoles },
+        ...request.prompt === callerPrompt ? {} : { promptSent: request.prompt },
+        ...frameIndex === undefined ? {} : { animationId: request.animationSet, animationRole: request.animationRole, frameIndex },
+      }))
+      await recordGeneratedImages(runtime.stateDir, records).catch((error) => { warn(ctx, error) })
+      if (request.animationSet !== undefined) {
+        await recordAnimation(runtime.stateDir, request.animationSet, request.animationRole, records).catch((error) => { warn(ctx, error) })
+      }
       return result
     },
   }

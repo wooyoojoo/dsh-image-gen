@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.0 — 2026-09-29
+
+**精灵图与动画工作流**：把「生成 2D 动作动画」这条路上反复手写的东西变成插件的参数与工具 —— 布局、动画集、参考图角色，加上 `tools/` 下六个零依赖脚本和一份方法论文档。
+
+### 新增
+
+- **`layout` 参数**：`2x2` / `3x2` / `4x2` / `2x3` / `6x1`。插件把网格、阅读顺序、透明底、「不许跨格」「不许出现格线/边框/字幕」等规则拼进 prompt（`layoutClause`），不必每次重写；单行布局会额外提示格子过窄（实测单行 6 帧每格仅 256px，接缝墨迹可达 178px）。
+- **`animationSet` / `animationRole`**：`key`（定版帧）/ `frame` / `smear` / `vfx`。第一次用 `key` 建立动画集，之后同集的每一帧**自动**把定版帧挂成第一张参考图，并在 prompt 里声明它是「本集的定版帧：对齐镜头、比例、画风与构图，但不要抄它的姿势」。集与帧序号记在 `$DSH_HOME/imagegen/animations.json`；给未知集名会被直接拒绝（提示先出定版帧）。
+- **`image` 支持角色**：`{ path, role }`，role ∈ `character` / `key` / `camera` / `proportions` / `pose` / `style` / `reference`。插件把它们写成一句 `Reference images, in order: 1) …`。动机是实测：未声明角色的镜头参考图会把它的画风、配色和背景一起带进来。
+- **索引记录新字段**：`layout`、`referenceRoles`、`animationId` / `animationRole` / `frameIndex`，以及只在组合过 prompt 时才出现的 `promptSent` —— `prompt` 始终是调用者自己写的话。
+- **`tools/`：六个零依赖脚本 + 共享模块**
+  - `probe-sheet` —— alpha / 每格包围盒 / 接缝墨迹体检
+  - `frame-tool` —— 单格裁/贴；粘贴前先擦格，并自检「上一版残留像素」为 0
+  - `slice` —— 按空白找刀口 + trim + **脚底锚点**对齐（`--anchor`）+ `--canvas`，装不下就报错而不是裁切
+  - `normalize` —— 单独生成的帧按**脸部连通域**对齐到序列尺度（剪影类指标在 smear 帧上会失真）
+  - `make-gif` —— 自带 GIF 编码器：中位切分量化 + LZW + GIF89a 动画块，不需要 ffmpeg
+  - `make-apng` —— 无损、真半透明、延迟是**精确分数**；自检到「把最后一帧解码回来逐字节相同」
+  - `frames.mjs` —— 共享的收集/加载/裁剪/曝光表/交付清单
+- **`--exposures=` 与 `--manifest=`**：用动画师的「格」（24fps）排节奏；`--manifest=exposure.json` 导出引擎直接读的交付清单（每帧格数 + 画布 + 裁剪框）。
+- **`docs/on-twos.md`**：方法论文档 —— on-twos 与曝光表、打击感曲线、**AI 生成版的五条额外规则**（6 帧上限 / 快段只放一张画 / smear 的正误写法 / VFX 不烘焙进角色序列 / 单独帧必须归一化）、完整制作流程、成本参考、坑清单速查。
+
+### 校验
+
+- `node smoke.mjs` → **89/89**（新增 10 项：布局展开与未知布局、参考图角色与非法角色、动画集锁定与自动挂参考、未知集拒绝、`prompt` 与 `promptSent` 的分离）
+- `node --check` 对 8 个工具脚本全部通过
+- 实测回归：GIF 写出器改用共享 `frames.mjs` 之后，输出与重构前 **SHA-256 完全一致**
+- 尺度归一化实测复现：单独生成的 impact 帧对命中帧 `x0.6672`
+
+### 已知缺口
+
+- **成套成本没有汇总**：单图 `usage` 已记录，「这一套动画花了多少」仍要人工累加；画廊按动画集聚合是客户端 `client.js` 的活，本轮没做。
+- **量测能力留在 `tools/`**：插件零依赖是刻意设计，不值得为 alpha 统计引入 `sharp`；插件页只显示 relay 返回的元数据。
+- **动画集只记录归属**，不校验播放顺序 —— 曝光表是交付物（`exposure.json`），不是插件状态。
+- `tools/` 与 `docs/` **不进发布包**（`files` 未列），它们是仓库内的开发资产。
+
 ## 0.4.0 — 2026-09-29
 
 **按 DSH 创造模式的插件规范收口**：去掉对 Harness 客户端包 `@deepseek-ai/dsh-client-ui-primitives` 的运行时 import，补齐灯箱缺掉的那一半行为，并让插件页的每个操作都能从对话里调用。

@@ -204,6 +204,25 @@ IMAGE_API_KEY=sk-...
 | `extra` | object | **逃生口**：任意其它字段原样进请求体；同名时显式参数优先 |
 | `providerOptions` | object | `extra` 的别名；两个都给时 `extra` 优先 |
 | `outputDir` | string | 本次落盘目录；相对路径相对配置的 `outputDir` 解析 |
+| `layout` | string | **精灵图布局**：`2x2` / `3x2` / `4x2` / `2x3` / `6x1`。插件把网格、阅读顺序、透明底、"不许跨格"等规则拼进 prompt，不必每次重写 |
+| `animationSet` | string | **动画集名**：同一套动画的所有帧共用一个名字 |
+| `animationRole` | string | 本帧角色：`key`（定版帧）/ `frame`（动作帧）/ `smear`（运动模糊的过渡帧）/ `vfx`（特效或受击资产）。必须与 `animationSet` 同给 |
+
+**`image` 也可以带角色**（这是让参考图不互相污染的关键）：
+
+```jsonc
+{ "prompt": "side view, mid-swing",
+  "image": [
+    { "path": "D:/art/sheet.png", "role": "character" },   // 只取角色设计
+    { "path": "D:/art/hollow.png", "role": "camera" },      // 只取镜头角度，不要它的画风配色
+    { "path": "D:/art/front.png",  "role": "proportions" }  // 只取头身比
+  ],
+  "layout": "3x2", "animationSet": "basin-smash", "animationRole": "frame" }
+```
+
+角色可选：`character` / `key`（本集的定版帧）/ `camera` / `proportions` / `pose` / `style` / `reference`。插件会把它们写成一句"Reference images, in order: 1) … 2) …"，因为**未声明的参考图会把它的画风一起带进来**。
+
+**动画集怎么用**：第一次用 `animationRole: "key"` 生成定版帧，之后同一 `animationSet` 的每一帧**自动**把定版帧挂成第一张参考图（并在 prompt 里说明它是"本集的定版帧：对齐镜头、比例、画风与构图，但不要抄它的姿势"）。帧序号、曝光表所需的顺序都记在 `$DSH_HOME/imagegen/animations.json` 里。给未知的集名会被直接拒绝 —— 先出定版帧。
 
 两个例子：
 
@@ -341,6 +360,32 @@ node smoke.mjs          # 或 pnpm test
 改动 `client.js` 后要额外确认一件事：**客户端半边写坏会让整个 GUI 起不来**（`dsh.client` 声明了却找不到 `./client` 时，加载期就报错），所以改完先跑 smoke、再单独启动一次 `dsh web` 确认能起来、最后才让 GUI 重启。
 
 第 1 步绿、第 2/3 步红，说明 DSH 侧的加载契约变了，改 `index.js` 里对应的调用即可：工具是 `ctx.tools.register`，插件页那两块是 `ctx.inject(['connection'], …)` 里的 `connection.fetch.register` 和 `client.js` 里的三处 `ctx.slots.register`。
+
+## 工具脚本：精灵图流水线
+
+`tools/` 下有三个独立脚本，把精灵图从「看着差不多」变成可复现的流程：**量测 → 单帧手术 → 切片归一化**。它们只借用环境里已有的 `sharp`（DSH 检出自带，用 `--dsh=<dir>` 指过去），不需要构建，也不需要装进本仓库。
+
+```sh
+node tools/probe-sheet.mjs sheet.png 3 2 --dsh="D:/DeepSeek Harness/deepseek-harness"
+node tools/frame-tool.mjs crop  sheet.png 3 2 5 frame6.png
+node tools/frame-tool.mjs paste sheet.png 3 2 5 new6.png out.png
+node tools/slice.mjs sheet.png 3 2 frames/
+node tools/make-gif.mjs --out=anim.gif --delay=9 --trim frames/
+```
+
+| 脚本 | 作用 | 关键点 |
+|---|---|---|
+| `probe-sheet.mjs` | 体检：alpha 事实、每格覆盖率与包围盒、分界线上的墨迹 | 实测**中继返回的透明图 `max alpha` 恒为 254、`fullyOpaque` 恒为 0.00%**（alpha 是软的，要硬边素材得自己阈值化）；还能量出「模型总把角色放大到填满格子」这一系统性行为 |
+| `frame-tool.mjs` | 单格裁/贴：只改一帧，其余帧一个像素不动 | `paste` **先把格子擦成全透明再贴**（少了这步，旧帧从新帧的透明区透出来就是重影），并自检"残留像素数"必须为 0 |
+| `slice.mjs` | 切片：按空白找刀口 + trim + **脚底锚点**对齐 + 拼验收条 | 锚点默认 `--anchor=feet`（脚底接触点钉死在同一画布坐标），能消掉"道具一甩、人物跟着跑"的抖动（实测 x 抖动 56px → 0）；没有真空隙时退化为"墨迹最少的那一行/列"并**如实报出切掉多少像素**；装不下就报错，不静默裁切 |
+| `make-gif.mjs` | 拼动图：**自带 GIF 编码器**（中位切分量化 + LZW + GIF89a 动画块），不需要 ffmpeg | 支持 `--delays=` **逐帧节奏**与 `--exposures=`（24fps 格数，动画师的单位）；写完用 sharp 回读自检 `pages=N`；GIF 没有半透明，边缘按 `--alpha` 二值化 |
+| `make-apng.mjs` | 拼 **APNG**：无损、真半透明、延迟是**精确分数**（`1/24` 直接写） | 补上 GIF 的两个硬伤：24fps 曝光表可原样进文件、抗锯齿边缘不被二值化；自检 = 分块结构 + 把最后一帧解码回来**逐字节比对**。代价是体积约 4×（实测 2.7 MB vs GIF 645 KB） |
+| `normalize.mjs` | 把**单独生成**的补充帧对齐到序列尺度 | 用**最大肤色连通域（脸）**当特征，对拖影/道具免疫（剪影类指标在 smear 帧上会失真）；实测复现 impact 帧 `x0.6672` |
+| `--manifest=` | `make-gif` / `make-apng` 的交付清单导出 | 产出 `exposure.json`：每帧的**24fps 格数** + 画布 + 裁剪框，即引擎直接读的曝光表 |
+
+为什么模型"只改一格"做不到、为什么切图不能按 1/N 硬切、以及这三个脚本怎么串起来，见 [tools/README.md](tools/README.md)。
+
+完整的动画方法论（on-twos / 曝光表 / smear 写法 / 冲击反馈的归属 / 尺度归一化 / 坑清单 / 成本参考）见 **[docs/on-twos.md](docs/on-twos.md)**。
 
 ## 移植到其它设备
 
