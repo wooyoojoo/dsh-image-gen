@@ -190,6 +190,14 @@ node tools/make-apng.mjs --out=anim.png --set=hair-ascend --publish --manifest=e
 
 **放哪儿最稳**：画廊的图片路由是普通读文件，**没有工作区边界**，所以资源根可以放在检出目录之外（例如 `D:\dsh-art`），静态图与动画就都不会随重拉仓库消失。插件那边还会在每个资源根下按会话隔离一层：`sessions/s-<会话 id 后 12 位>/`。
 
+## strip.mjs —— 把任意几帧拼成一条对比带
+
+```sh
+node tools/strip.mjs --out=compare.png 邻居1.png 缩放后的帧.png 邻居2.png
+```
+
+底对齐横向拼接，用来给 `normalize.mjs` 收尾：**数值只能保证量级，眼睛才能确认**缩放对不对（例如单帧重画的角色是否与邻帧同高、脚是否在同一条线上）。
+
 ## relocate.mjs —— 把散落的资源搬进统一根
 
 ```sh
